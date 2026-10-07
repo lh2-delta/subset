@@ -1,0 +1,18 @@
+services:
+  subset:
+    build: .
+    ports:
+      - "${UI_PORT:-8768}:8768"
+    environment:
+      SUBSET_DOCKER: "1"
+      DEFAULT_LOCAL_REPOS_DIR: /data/repos
+      DEFAULT_TOKENS_FILE: /app/secrets/tokens
+      PYTHONUNBUFFERED: "1"
+      BITBUCKET_DC_URL: "${BITBUCKET_DC_URL:-}"
+    volumes:
+      # Mount the directory, not the file, so a tokens file created after the
+      # container starts is still visible (single-file mounts pin one inode).
+      - ./secrets:/app/secrets:ro
+      - ./outputs:/app/outputs
+      - ${LOCAL_REPOS_DIR:-./repos}:/data/repos:ro
+    restart: unless-stopped

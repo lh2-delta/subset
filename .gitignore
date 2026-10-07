@@ -1,0 +1,10 @@
+tokens
+secrets/
+.env
+__pycache__/
+*.py[cod]
+.DS_Store
+repos/*
+!repos/.gitkeep
+outputs/*
+!outputs/.gitkeep

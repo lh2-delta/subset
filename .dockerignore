@@ -1,0 +1,10 @@
+.git
+.gitignore
+outputs
+repos
+tokens
+.env
+__pycache__
+*.pyc
+README.md
+test_*.py

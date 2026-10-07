@@ -1,0 +1,7 @@
+# Copy to ./tokens (CLI) or secrets/tokens (Docker). Only needed for PRIVATE remote repos.
+# Any key name containing github / gitlab / bitbucket works.
+github_token=ghp_xxx
+gitlab_token=glpat-xxx
+bitbucket_token=xxx
+# Bitbucket Data Center / Server HTTP access token (key must contain dc, server or datacenter)
+bitbucket_dc_token=xxx
