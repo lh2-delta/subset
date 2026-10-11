@@ -29,6 +29,12 @@ SAMPLES_DIRNAME = "samples"
 LOG_NAME = "sampling_log.jsonl"
 REPORT_NAME = "sampling_report.json"
 
+GIT_HARDENING_ARGS = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor="]
+FALLBACK_BRANCHES = ("main", "master", "trunk")
+# Config an upstream clone leaves behind that must not ship (URLs can carry credentials).
+STRIPPED_CONFIG_PREFIXES = ("remote.", "branch.", "submodule.", "credential.", "url.", "http.")
+STRIPPED_CONFIG_KEYS = ("core.fsmonitor", "core.hookspath", "core.sshcommand", "core.gitproxy")
+
 _log_lock = threading.Lock()
 
 
@@ -130,9 +136,11 @@ def load_dotenv_file(path: Path) -> None:
 
 def _git(args: list[str], cwd: Path, check: bool = True,
          timeout: int = GIT_TIMEOUT_SECONDS) -> subprocess.CompletedProcess:
-    env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"}
+    # The repo under sampling is untrusted: its config may point core.fsmonitor or
+    # core.hooksPath at an executable, which git would otherwise run on our behalf.
+    env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1", "GIT_CONFIG_NOSYSTEM": "1"}
     proc = subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True,
+        ["git", *GIT_HARDENING_ARGS, *args], cwd=str(cwd), capture_output=True, text=True,
         timeout=timeout, env=env,
     )
     if check and proc.returncode != 0:
@@ -149,16 +157,31 @@ def _is_promisor_clone(repo: Path) -> bool:
     return "promisor = true" in cfg.read_text(encoding="utf-8", errors="ignore")
 
 
-def _default_branch(repo: Path) -> str:
-    head = _git(["symbolic-ref", "--short", "-q", "HEAD"], repo, check=False)
-    if head.stdout.strip():
-        return head.stdout.strip()
+def _ref_exists(repo: Path, ref: str) -> bool:
+    return _git(["show-ref", "--verify", "--quiet", ref], repo, check=False).returncode == 0
+
+
+def _default_branch(repo: Path) -> tuple[str, str, str]:
+    """(short name, full ref, how it was chosen).
+
+    A local repo often has a feature branch checked out, so HEAD is the last resort:
+    origin/HEAD, then main/master/trunk, then whatever HEAD is.
+    """
     origin_head = _git(
-        ["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"], repo, check=False
-    )
-    if origin_head.stdout.strip():
-        return origin_head.stdout.strip().split("/", 1)[-1]
-    raise SampleSkipped("no branch to sample (detached HEAD and no origin/HEAD)")
+        ["symbolic-ref", "-q", "refs/remotes/origin/HEAD"], repo, check=False
+    ).stdout.strip()
+    if origin_head.startswith("refs/remotes/origin/") and _ref_exists(repo, origin_head):
+        name = origin_head[len("refs/remotes/origin/"):]
+        local = f"refs/heads/{name}"
+        return name, local if _ref_exists(repo, local) else origin_head, "origin/HEAD"
+    for name in FALLBACK_BRANCHES:
+        local = f"refs/heads/{name}"
+        if _ref_exists(repo, local):
+            return name, local, f"conventional name {name!r}"
+    head = _git(["symbolic-ref", "-q", "HEAD"], repo, check=False).stdout.strip()
+    if head.startswith("refs/heads/") and _ref_exists(repo, head):
+        return head[len("refs/heads/"):], head, "checked-out HEAD"
+    raise SampleSkipped("no branch to sample (detached HEAD, no origin/HEAD, no main/master/trunk)")
 
 
 def _cutoff(repo: Path, ref: str, pct: float, min_commits: int) -> tuple[str, int, int]:
@@ -168,29 +191,68 @@ def _cutoff(repo: Path, ref: str, pct: float, min_commits: int) -> tuple[str, in
             f"only {total} commits on {ref!r}, below the minimum of {min_commits}"
         )
     keep = min(total, max(1, math.ceil(total * pct / 100)))
-    shas = _git(["rev-list", "--reverse", ref, "--"], repo).stdout.splitlines()
+    # Topological, not date order: commit dates can be skewed or merged out of order,
+    # and only a topo prefix is closed under "parent of", so the ancestors of
+    # shas[keep-1] can never exceed `keep`.
+    shas = _git(["rev-list", "--topo-order", "--reverse", ref, "--"], repo).stdout.splitlines()
     return shas[keep - 1], total, keep
 
 
-def _truncate(work: Path, cutoff_sha: str, sample_branch: str) -> None:
+def _commit_objects_on_disk(repo: Path) -> int:
+    out = _git(["cat-file", "--batch-all-objects", "--batch-check=%(objecttype)"], repo).stdout
+    return sum(1 for line in out.splitlines() if line == "commit")
+
+
+def _strip_config(work: Path) -> None:
+    names = _git(["config", "--local", "--list", "--name-only"], work, check=False).stdout.splitlines()
+    for name in dict.fromkeys(names):
+        low = name.lower()
+        if low.startswith(STRIPPED_CONFIG_PREFIXES) or low in STRIPPED_CONFIG_KEYS:
+            _git(["config", "--local", "--unset-all", name], work, check=False)
+
+
+def _truncate(work: Path, cutoff_sha: str, sample_branch: str, keep: int) -> int:
+    """Cut history at cutoff_sha, leaving nothing past it reachable or on disk.
+
+    Returns the commit count in the sample.
+    """
+    git_dir = work / ".git"
     _git(["reset", "--hard", "--quiet"], work)
     _git(["clean", "-fdx", "--quiet"], work)
     _git(["checkout", "--quiet", "--force", cutoff_sha], work)
-    _git(["checkout", "--quiet", "-b", sample_branch], work)
+    _git(["checkout", "--quiet", "-B", sample_branch], work)
 
-    branches = _git(["for-each-ref", "--format=%(refname:short)", "refs/heads"], work).stdout.split()
-    for branch in branches:
-        if branch != sample_branch:
-            _git(["branch", "-D", branch], work, check=False)
+    # refs/replace could graft history back in; the rest (stash, notes, pull/*,
+    # original/*, remotes, tags) can each point past the cutoff.
+    keep_ref = f"refs/heads/{sample_branch}"
+    for ref in _git(["for-each-ref", "--format=%(refname)"], work).stdout.split():
+        if ref != keep_ref:
+            _git(["update-ref", "--no-deref", "-d", ref], work, check=False)
 
-    _git(["remote", "remove", "origin"], work, check=False)
-    for ref in _git(["for-each-ref", "--format=%(refname)", "refs/remotes"], work, check=False).stdout.split():
-        _git(["update-ref", "-d", ref], work, check=False)
-    # Tags can point past the cutoff and would keep the later history reachable.
-    for tag in _git(["tag", "--list"], work, check=False).stdout.split():
-        _git(["tag", "-d", tag], work, check=False)
-    _git(["reflog", "expire", "--expire=now", "--all"], work)
+    # Alternates would leave the sample dependent on (and borrowing from) the source.
+    if (git_dir / "objects" / "info" / "alternates").exists():
+        _git(["repack", "-a", "-d", "-q"], work)
+        (git_dir / "objects" / "info" / "alternates").unlink()
+
+    _strip_config(work)
+    for stale in ("FETCH_HEAD", "ORIG_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "shallow"):
+        (git_dir / stale).unlink(missing_ok=True)
+    for stale_dir in ("modules", "lfs", "worktrees", "logs", "hooks"):
+        shutil.rmtree(git_dir / stale_dir, ignore_errors=True)
+    (git_dir / "info" / "grafts").unlink(missing_ok=True)
+
+    _git(["reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all"], work)
     _git(["gc", "--prune=now", "--quiet"], work)
+
+    reachable = int(_git(["rev-list", "--count", "--all"], work).stdout.strip())
+    head_only = int(_git(["rev-list", "--count", "HEAD"], work).stdout.strip())
+    on_disk = _commit_objects_on_disk(work)
+    if reachable != head_only or on_disk != reachable or reachable > keep:
+        raise RuntimeError(
+            f"truncation leaked history: {reachable} reachable (HEAD {head_only}), "
+            f"{on_disk} commit objects on disk, limit {keep}"
+        )
+    return reachable
 
 
 def append_log(run_dir: Path, entry: dict) -> None:
@@ -231,8 +293,14 @@ def take_sample(
                 "source is a partial (blobless) clone; historical blobs are missing "
                 "so the sample would be incomplete"
             )
-        branch = _default_branch(source)
-        cutoff_sha, total, keep = _cutoff(source, branch, pct, min_commits)
+        if _git(["rev-parse", "--is-shallow-repository"], source).stdout.strip() == "true":
+            raise SampleSkipped(
+                "source is a shallow clone; its commit count and cutoff would be wrong "
+                "(run `git fetch --unshallow` first)"
+            )
+        branch, branch_ref, branch_how = _default_branch(source)
+        log.info("SAMPLE %s: using branch %s (%s)", repo_name, branch, branch_how)
+        cutoff_sha, total, keep = _cutoff(source, branch_ref, pct, min_commits)
 
         for stale in (dest, staging):
             if stale.exists():
@@ -244,14 +312,16 @@ def take_sample(
             shutil.copytree(source, staging, symlinks=True)
 
         sample_branch = f"sample{pct:g}pct".replace(".", "_")
-        _truncate(staging, cutoff_sha, sample_branch)
-        reachable = int(_git(["rev-list", "--count", "HEAD"], staging).stdout.strip())
+        reachable = _truncate(staging, cutoff_sha, sample_branch, keep)
         fsck = _git(["fsck", "--full"], staging, check=False)
         fsck_clean = fsck.returncode == 0 and not fsck.stdout.strip()
+        if not fsck_clean:
+            raise SampleSkipped(f"sample failed git fsck: {fsck.stdout.strip() or fsck.stderr.strip()[:300]}")
 
         manifest = {
             "repo": repo_name,
             "branch_sampled": branch,
+            "branch_chosen_by": branch_how,
             "sample_branch_name": sample_branch,
             "requested_pct": pct,
             "total_commits": total,
@@ -264,8 +334,6 @@ def take_sample(
         (staging / "SAMPLE_MANIFEST.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         staging.rename(dest)
 
-        if not fsck_clean:
-            log.warning("SAMPLE fsck issues for %s: %s", repo_name, fsck.stdout.strip()[:300])
         log.info("SAMPLED %s: %s of %s commits on %s", repo_name, reachable, total, branch)
         append_log(run_dir, {
             "repo": repo_name, "slug": slug, "status": "sampled",
