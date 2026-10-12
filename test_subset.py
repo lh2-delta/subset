@@ -271,6 +271,209 @@ class ForgeDiscoveryTests(unittest.TestCase):
         self.assertIn("PROJ/alpha", out.getvalue())
 
 
+def commit_dated(path: Path, name: str, date: str) -> None:
+    (path / name).write_text(name)
+    git(path, "add", "-A")
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e.com",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e.com",
+           "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date}
+    subprocess.run(["git", "commit", "-q", "-m", name], cwd=path, check=True, capture_output=True, env=env)
+
+
+class HardeningTests(Base):
+    def sample(self, source: Path, pct: float = 10, min_commits: int = 20, disposable: bool = False):
+        import logging
+        run_dir = self.tmp / "run"
+        ok = sampler.take_sample(repo_name=source.name, slug=source.name, source=source,
+                                 disposable=disposable, run_dir=run_dir, pct=pct,
+                                 min_commits=min_commits, log=logging.getLogger("t"))
+        out = run_dir / "samples" / source.name
+        reason = ""
+        log = run_dir / "samples" / sampler.LOG_NAME
+        if log.is_file():
+            reason = json.loads(log.read_text().splitlines()[-1]).get("reason", "")
+        return ok, out, reason
+
+    def test_skewed_dates_do_not_leak_history(self):
+        repo = self.tmp / "skew"
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        for i in range(40):  # each later commit has an OLDER date
+            commit_dated(repo, f"f{i}", f"{2020 - i}-01-01T00:00:00Z")
+        ok, out, _ = self.sample(repo)
+        self.assertTrue(ok)
+        self.assertEqual(git(out, "rev-list", "--count", "--all"), "4")
+        self.assertEqual(git(out, "log", "-1", "--format=%s"), "f3")
+
+    def test_merge_history_never_exceeds_keep(self):
+        repo = make_repo(self.tmp / "merge", 10)
+        git(repo, "checkout", "-q", "-b", "side", "HEAD~5")
+        for i in range(8):
+            (repo / f"s{i}").write_text("s")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-q", "-m", f"s{i}")
+        git(repo, "checkout", "-q", "main")
+        git(repo, "merge", "-q", "--no-ff", "-m", "merge", "side")
+        for i in range(25):
+            (repo / f"m{i}").write_text("m")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-q", "-m", f"m{i}")
+        total = int(git(repo, "rev-list", "--count", "main"))
+        ok, out, _ = self.sample(repo, pct=30)
+        self.assertTrue(ok)
+        keep = -(-total * 30 // 100)
+        self.assertLessEqual(int(git(out, "rev-list", "--count", "--all")), keep)
+
+    def test_all_extra_refs_and_remotes_are_dropped(self):
+        repo = make_repo(self.tmp / "refs", 40)
+        late = git(repo, "rev-parse", "HEAD")
+        git(repo, "tag", "-a", "v1", "-m", "x")
+        (repo / "wip").write_text("w")
+        git(repo, "add", "wip")
+        git(repo, "stash", "-q")
+        git(repo, "notes", "add", "-m", "n", "HEAD")
+        git(repo, "update-ref", "refs/pull/1/head", late)
+        git(repo, "update-ref", "refs/original/refs/heads/main", late)
+        git(repo, "update-ref", "refs/remotes/upstream/main", late)
+        git(repo, "remote", "add", "upstream", "https://user:pw@example.invalid/x.git")
+        git(repo, "config", "branch.main.remote", "upstream")
+        (repo / ".git" / "FETCH_HEAD").write_text(late + "\t\turl\n")
+        (repo / ".git" / "ORIG_HEAD").write_text(late + "\n")
+        ok, out, reason = self.sample(repo)
+        self.assertTrue(ok, reason)
+        refs = git(out, "for-each-ref", "--format=%(refname)").splitlines()
+        self.assertEqual(refs, ["refs/heads/sample10pct"])
+        self.assertEqual(git(out, "rev-list", "--count", "--all"), "4")
+        cfg = (out / ".git" / "config").read_text()
+        self.assertNotIn("pw@", cfg)
+        self.assertNotIn("remote", cfg)
+        self.assertFalse((out / ".git" / "FETCH_HEAD").exists())
+        self.assertFalse((out / ".git" / "ORIG_HEAD").exists())
+        # post-cutoff commit objects are physically gone, not just unreachable
+        missing = subprocess.run(["git", "cat-file", "-e", late], cwd=out)
+        self.assertNotEqual(missing.returncode, 0)
+
+    def test_lfs_objects_removed(self):
+        repo = make_repo(self.tmp / "lfs", 40)
+        blob = repo / ".git" / "lfs" / "objects" / "ab" / "cd" / "abcdef"
+        blob.parent.mkdir(parents=True)
+        blob.write_text("post-cutoff blob")
+        ok, out, reason = self.sample(repo)
+        self.assertTrue(ok, reason)
+        self.assertFalse((out / ".git" / "lfs").exists())
+        self.assertTrue(blob.exists(), "source repo must stay untouched")
+
+    def test_shallow_clone_is_skipped(self):
+        full = make_repo(self.tmp / "full", 40)
+        shallow = self.tmp / "shallow"
+        subprocess.run(["git", "clone", "-q", "--depth", "30", full.as_uri(), str(shallow)],
+                       check=True, capture_output=True)
+        ok, _, reason = self.sample(shallow, min_commits=20)
+        self.assertFalse(ok)
+        self.assertIn("shallow", reason)
+
+    def test_default_branch_prefers_main_over_checked_out_feature(self):
+        repo = make_repo(self.tmp / "feat", 40)
+        git(repo, "checkout", "-q", "-b", "feature")
+        for i in range(10):
+            (repo / f"x{i}").write_text("x")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-q", "-m", f"x{i}")
+        ok, out, reason = self.sample(repo)
+        self.assertTrue(ok, reason)
+        manifest = json.loads((out / "SAMPLE_MANIFEST.json").read_text())
+        self.assertEqual((manifest["branch_sampled"], manifest["total_commits"]), ("main", 40))
+        self.assertIn("main", manifest["branch_chosen_by"])
+
+    def test_source_hooks_and_fsmonitor_never_run(self):
+        repo = make_repo(self.tmp / "evil", 40)
+        marker = self.tmp / "ran"
+        hooks = self.tmp / "hooks"
+        hooks.mkdir()
+        hook = hooks / "post-checkout"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        hook.chmod(0o755)
+        mon = self.tmp / "mon.sh"
+        mon.write_text(f"#!/bin/sh\ntouch {marker}\nprintf '\\0'\n")
+        mon.chmod(0o755)
+        git(repo, "config", "core.hooksPath", str(hooks))
+        git(repo, "config", "core.fsmonitor", str(mon))
+        marker.unlink(missing_ok=True)
+        ok, out, reason = self.sample(repo)
+        self.assertTrue(ok, reason)
+        self.assertFalse(marker.exists())
+        cfg = (out / ".git" / "config").read_text().lower()
+        self.assertNotIn("hookspath", cfg)
+        self.assertNotIn("fsmonitor", cfg)
+
+    def test_fsck_failure_is_a_skip(self):
+        repo = make_repo(self.tmp / "bad", 40)
+        real = sampler._git
+
+        def fake(args, cwd, check=True, timeout=sampler.GIT_TIMEOUT_SECONDS):
+            if args[:1] == ["fsck"]:
+                return subprocess.CompletedProcess(args, 1, "broken link", "")
+            return real(args, cwd, check, timeout)
+
+        with unittest.mock.patch.object(sampler, "_git", fake):
+            ok, out, reason = self.sample(repo)
+        self.assertFalse(ok)
+        self.assertIn("fsck", reason)
+        self.assertFalse(out.exists())
+
+    def test_zip_stores_symlinks_not_targets(self):
+        secret = self.tmp / "host-secret"
+        secret.write_text("TOPSECRET")
+        run_dir = self.tmp / "subset-x"
+        (run_dir / "samples").mkdir(parents=True)
+        (run_dir / "samples" / "link").symlink_to(secret)
+        (run_dir / "samples" / "dirlink").symlink_to(self.tmp, target_is_directory=True)
+        (run_dir / "samples" / "real.txt").write_text("ok")
+        with zipfile.ZipFile(subset.zip_run_dir(run_dir)) as zf:
+            names = zf.namelist()
+            self.assertEqual(zf.read("subset-x/samples/link"), str(secret).encode())
+            self.assertEqual(zf.getinfo("subset-x/samples/link").external_attr >> 28, 0o12)
+            self.assertIn("subset-x/samples/dirlink", names)
+            self.assertFalse(any(n.startswith("subset-x/samples/dirlink/") for n in names))
+            self.assertEqual(zf.read("subset-x/samples/real.txt"), b"ok")
+            self.assertNotIn(b"TOPSECRET", b"".join(zf.read(n) for n in names if not n.endswith("/")))
+
+
+class RepoSelectionTests(Base):
+    def test_parent_that_is_a_repo_does_not_hijack_selection(self):
+        parent = make_repo(self.tmp / "parent", 3)
+        make_repo(parent / "child", 40)
+        self.assertEqual([t.full_name for t in subset.discover_local_repos(parent)], ["parent"])
+        got = subset.resolve_local_selectors(parent, ["child"])
+        self.assertEqual([t.full_name for t in got], ["child"])
+        self.assertEqual(got[0].local_path, parent.resolve() / "child")
+
+    def test_ambiguous_bare_name_errors(self):
+        make_repo(self.repos / "other" / "big", 30)
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            subset.resolve_local_selectors(self.repos, ["big"])
+        got = subset.resolve_local_selectors(self.repos, ["acme/big"])
+        self.assertEqual([t.full_name for t in got], ["acme/big"])
+        rc = subset.main(["--local-repos-dir", str(self.repos), "--repo", "big",
+                          "--output-dir", str(self.tmp / "o")])
+        self.assertEqual(rc, 2)
+
+    def test_squirrel_style_invocation_samples_exact_repo(self):
+        parent = make_repo(self.tmp / "parent2", 3)
+        make_repo(parent / "child", 40)
+        rc = subset.main(["--local-repos-dir", str(parent), "--repo", "child",
+                          "--output-dir", str(self.tmp / "o2")])
+        self.assertEqual(rc, 0)
+        out = next((self.tmp / "o2").glob("subset-*/samples/child"))
+        self.assertEqual(git(out, "rev-list", "--count", "HEAD"), "2")
+
+    def test_repo_path(self):
+        rc = subset.main(["--repo-path", str(self.repos / "solo"), "--output-dir", str(self.tmp / "o3")])
+        self.assertEqual(rc, 0)
+        self.assertTrue(next((self.tmp / "o3").glob("subset-*/samples/solo")).is_dir())
+        self.assertEqual(subset.main(["--repo-path", str(self.tmp / "nope")]), 2)
+
+
 class UiTests(Base):
     def setUp(self):
         super().setUp()

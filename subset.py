@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -80,6 +81,38 @@ def discover_local_repos(root: Path) -> list[Target]:
 
     walk(root, 0)
     return found
+
+
+def resolve_local_selectors(root: Path, selectors: list[str]) -> list[Target]:
+    """Exact local repos for --repo selectors.
+
+    A selector naming a direct child of `root` that is a git tree wins outright, so
+    it works even when `root` is itself a repo (discovery would stop there and
+    return only root). Otherwise it must match exactly one discovered repo;
+    a bare name matching several is an error, never a silent pick.
+    """
+    root = root.resolve()
+    found: dict[str, Target] = {}
+    discovered: list[Target] | None = None
+    for raw in selectors:
+        sel = raw.strip().strip("/")
+        if not sel:
+            continue
+        direct = root / sel
+        if (direct / ".git").exists() and direct.resolve().parent == root.joinpath(*Path(sel).parts[:-1]).resolve():
+            found.setdefault(sel, Target(full_name=sel, local_path=direct))
+            continue
+        if discovered is None:
+            discovered = discover_local_repos(root)
+        hits = [t for t in discovered if sampler.selector_matches(sel.lower(), t.full_name)]
+        if len(hits) > 1:
+            raise ValueError(
+                f"--repo {raw!r} is ambiguous under {root}: "
+                + ", ".join(t.full_name for t in hits) + "; use org/repo or --repo-path"
+            )
+        if hits:
+            found.setdefault(hits[0].full_name, hits[0])
+    return list(found.values())
 
 
 def parse_remote(spec: str, default_platform: str = "github", gitlab_host: str = "gitlab.com") -> Target:
@@ -219,13 +252,31 @@ def zip_run_dir(run_dir: Path) -> Path:
     zip_path = run_dir.with_suffix(".zip")
     if zip_path.exists():
         zip_path.unlink()
+    base = run_dir.parent
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for path in run_dir.rglob("*"):
-            if path.relative_to(run_dir).parts[0] == "clones":
+        for root, dirs, files in os.walk(run_dir, followlinks=False):
+            rel_root = Path(root).relative_to(run_dir)
+            if rel_root.parts[:1] == ("clones",):
+                dirs[:] = []
                 continue
+            if rel_root == Path("."):
+                dirs[:] = [d for d in dirs if d != "clones"]
             # Empty dirs matter: git refuses a repo without .git/refs/{heads,tags}.
-            if path.is_file() or (path.is_dir() and not any(path.iterdir())):
-                zf.write(path, path.relative_to(run_dir.parent).as_posix())
+            if not dirs and not files:
+                zf.write(root, Path(root).relative_to(base).as_posix())
+            for name in files + [d for d in dirs if (Path(root) / d).is_symlink()]:
+                path = Path(root) / name
+                arc = path.relative_to(base).as_posix()
+                if path.is_symlink():
+                    # Store the link itself; ZipFile.write would embed the target's
+                    # contents, which for a tracked `link -> /etc/passwd` is a host file.
+                    info = zipfile.ZipInfo(arc)
+                    info.create_system = 3
+                    info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                    zf.writestr(info, os.readlink(path))
+                else:
+                    zf.write(path, arc)
+            dirs[:] = [d for d in dirs if not (Path(root) / d).is_symlink()]
     return zip_path
 
 
@@ -314,6 +365,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ui-host", default="127.0.0.1")
     ap.add_argument("--ui-port", type=int, default=8768)
     ap.add_argument("--local-repos-dir", type=Path, help="folder holding git clones (searched 3 levels deep)")
+    ap.add_argument("--repo-path", action="append", type=Path, default=[],
+                    help="exact path of one git working tree to sample (repeatable); "
+                         "unambiguous alternative to --local-repos-dir + --repo")
     ap.add_argument("--remote", action="append", default=[], help="owner/repo or repo URL (repeatable)")
     ap.add_argument("--remote-file", type=Path, help="text file with one --remote entry per line")
     ap.add_argument("--default-platform", choices=["github", "gitlab", "bitbucket"], default="github")
@@ -360,7 +414,20 @@ def main(argv: list[str] | None = None) -> int:
         if not args.local_repos_dir.is_dir():
             print(f"error: not a directory: {args.local_repos_dir}", file=sys.stderr)
             return 2
-        targets += discover_local_repos(args.local_repos_dir)
+        if args.repo:
+            try:
+                local = resolve_local_selectors(args.local_repos_dir, args.repo)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+        else:
+            local = discover_local_repos(args.local_repos_dir)
+        targets += local
+    for path in args.repo_path:
+        if not (path / ".git").exists():
+            print(f"error: not a git working tree: {path}", file=sys.stderr)
+            return 2
+        targets.append(Target(full_name=path.resolve().name, local_path=path.resolve()))
     entries = list(args.remote)
     if args.remote_file:
         entries += [ln for ln in args.remote_file.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
@@ -371,7 +438,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
     if not targets:
-        print("error: no repos found; give --local-repos-dir, --remote or --discover", file=sys.stderr)
+        print("error: no repos found; give --local-repos-dir, --repo-path, --remote or --discover", file=sys.stderr)
         return 2
 
     result = run_job(
