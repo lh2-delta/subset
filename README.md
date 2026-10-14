@@ -26,7 +26,10 @@ logs/subset.log                 full run log
 
 **The samples contain real source code and history.** Treat the zip accordingly.
 
-How a sample is cut: take the repo's default branch, keep the oldest `ceil(total x 5 / 100)`
+How a sample is cut: take the branch whose tip commit is newest (the rule the profiler and Garmr
+use, so the sample comes from the branch that was measured; a tie goes to the default branch, and
+`SUBSET_USE_DEFAULT_BRANCH=1` restores the old "default branch only" behaviour; the manifest's
+`branch_chosen_by` says which rule applied), keep the oldest `ceil(total x 5 / 100)`
 commits, delete every other branch, tag and remote, then `git gc`. Tags are deleted because a tag
 past the cutoff would keep the later history reachable.
 
@@ -167,7 +170,7 @@ A name passed to `--repo` that matches no repo is reported under `selectors_matc
 ## Notes and limits
 
 - Local repos are **copied** before slicing, so you need free disk space for one copy per worker at a time.
-- Only the default branch's history is sampled (the branch checked out in a local clone).
+- Only one branch's history is sampled: the newest-commit branch (or the default branch with `SUBSET_USE_DEFAULT_BRANCH=1`).
 - One run at a time in the UI. Close the terminal and a running job stops.
 - The UI binds to `127.0.0.1` (or `0.0.0.0` inside Docker, published to your host only through the compose port).
 

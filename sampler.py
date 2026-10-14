@@ -184,6 +184,29 @@ def _default_branch(repo: Path) -> tuple[str, str, str]:
     raise SampleSkipped("no branch to sample (detached HEAD, no origin/HEAD, no main/master/trunk)")
 
 
+def _measured_branch(repo: Path) -> tuple[str, str, str]:
+    """(short name, full ref, how it was chosen): the branch whose tip commit is newest, the rule the profiler and Garmr use,
+    so the sample is cut from the branch that was measured. A tie goes to the default branch. The default branch stays the
+    answer when there is no other branch or SUBSET_USE_DEFAULT_BRANCH=1 asks for the old behaviour."""
+    default = _default_branch(repo)
+    if os.environ.get("SUBSET_USE_DEFAULT_BRANCH", "").strip().lower() in ("1", "true", "yes", "on"):
+        return default
+    prefix = "refs/heads/"
+    tips = []
+    for line in _git(["for-each-ref", "--format=%(refname)%09%(committerdate:unix)", prefix], repo).stdout.splitlines():
+        ref, _, ts = line.partition("\t")
+        if ref.startswith(prefix) and ts.strip().isdigit():
+            tips.append((int(ts), ref[len(prefix):]))
+    if not tips:
+        return default
+    newest = max(ts for ts, _ in tips)
+    tied = sorted(name for ts, name in tips if ts == newest)
+    chosen = default[0] if default[0] in tied else tied[0]
+    if chosen == default[0]:
+        return default
+    return chosen, prefix + chosen, f"newest commit (default {default[0]!r})"
+
+
 def _cutoff(repo: Path, ref: str, pct: float, min_commits: int) -> tuple[str, int, int]:
     total = int(_git(["rev-list", "--count", ref, "--"], repo).stdout.strip())
     if total < min_commits:
@@ -298,7 +321,7 @@ def take_sample(
                 "source is a shallow clone; its commit count and cutoff would be wrong "
                 "(run `git fetch --unshallow` first)"
             )
-        branch, branch_ref, branch_how = _default_branch(source)
+        branch, branch_ref, branch_how = _measured_branch(source)
         log.info("SAMPLE %s: using branch %s (%s)", repo_name, branch, branch_how)
         cutoff_sha, total, keep = _cutoff(source, branch_ref, pct, min_commits)
 
