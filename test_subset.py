@@ -372,14 +372,43 @@ class HardeningTests(Base):
         self.assertFalse(ok)
         self.assertIn("shallow", reason)
 
-    def test_default_branch_prefers_main_over_checked_out_feature(self):
-        repo = make_repo(self.tmp / "feat", 40)
-        git(repo, "checkout", "-q", "-b", "feature")
+    def _repo_with_feature(self, name: str, feature_date: str, main_date: str = "2020-01-01T00:00:00"):
+        """main: 40 commits dated main_date; feature (checked out): 10 more commits dated feature_date."""
+        path = self.tmp / name
+        path.mkdir()
+        git(path, "init", "-q", "-b", "main")
+
+        def commit(label: str, date: str) -> None:
+            (path / label).write_text(label)
+            git(path, "add", "-A")
+            subprocess.run(["git", "commit", "-q", "-m", label], cwd=path, check=True, capture_output=True,
+                           env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e.com", "GIT_COMMITTER_NAME": "t",
+                                "GIT_COMMITTER_EMAIL": "t@e.com", "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date})
+
+        for i in range(40):
+            commit(f"m{i}", main_date)
+        git(path, "checkout", "-q", "-b", "feature")
         for i in range(10):
-            (repo / f"x{i}").write_text("x")
-            git(repo, "add", "-A")
-            git(repo, "commit", "-q", "-m", f"x{i}")
-        ok, out, reason = self.sample(repo)
+            commit(f"x{i}", feature_date)
+        return path
+
+    def test_the_branch_with_the_newest_commit_is_sampled_not_the_default(self):
+        ok, out, reason = self.sample(self._repo_with_feature("newer", "2024-01-01T00:00:00"))
+        self.assertTrue(ok, reason)
+        manifest = json.loads((out / "SAMPLE_MANIFEST.json").read_text())
+        self.assertEqual((manifest["branch_sampled"], manifest["total_commits"]), ("feature", 50))
+        self.assertIn("newest commit", manifest["branch_chosen_by"])
+
+    def test_a_tie_between_branches_goes_to_the_default_branch(self):
+        same = "2022-01-01T00:00:00"
+        ok, out, reason = self.sample(self._repo_with_feature("tie", same, main_date=same))
+        self.assertTrue(ok, reason)
+        manifest = json.loads((out / "SAMPLE_MANIFEST.json").read_text())
+        self.assertEqual((manifest["branch_sampled"], manifest["total_commits"]), ("main", 40))
+
+    def test_default_branch_prefers_main_over_checked_out_feature_when_asked(self):
+        with unittest.mock.patch.dict(os.environ, {"SUBSET_USE_DEFAULT_BRANCH": "1"}):
+            ok, out, reason = self.sample(self._repo_with_feature("old", "2024-01-01T00:00:00"))
         self.assertTrue(ok, reason)
         manifest = json.loads((out / "SAMPLE_MANIFEST.json").read_text())
         self.assertEqual((manifest["branch_sampled"], manifest["total_commits"]), ("main", 40))
