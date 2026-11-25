@@ -273,6 +273,7 @@ def take_sample(
     pct: float,
     min_commits: int,
     log: logging.Logger,
+    extra_manifest: dict | None = None,
 ) -> bool:
     """Write run_dir/samples/<slug>/ holding the first pct% of history.
 
@@ -330,6 +331,7 @@ def take_sample(
             "reachable_commits_in_sample": reachable,
             "fsck_clean": fsck_clean,
             "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            **(extra_manifest or {}),
         }
         (staging / "SAMPLE_MANIFEST.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         staging.rename(dest)
@@ -339,6 +341,7 @@ def take_sample(
             "repo": repo_name, "slug": slug, "status": "sampled",
             "total_commits": total, "sampled_commits": reachable,
             "fsck_clean": fsck_clean,
+            **({"source_vcs": extra_manifest["source_vcs"]} if extra_manifest and "source_vcs" in extra_manifest else {}),
         })
         return True
     except SampleSkipped as exc:

@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import plastic
 import repo_discovery
 import sampler
 import subset
@@ -75,7 +76,7 @@ def page() -> str:
         "(the <code>LOCAL_REPOS_DIR</code> folder on your computer). Results land in <code>./outputs</code>.</p>"
         if is_docker() else ""
     )
-    return (PAGE.replace("__CSRF__", CSRF_TOKEN).replace("__DC_URL__", escape(subset.dc_url_from_env())).replace("__DOCKER_NOTE__", docker_note)
+    return (PAGE.replace("__CSRF__", CSRF_TOKEN).replace("__DC_URL_JS__", json.dumps(subset.dc_url_from_env()).replace("<", "\\u003c")).replace("__DC_URL__", escape(subset.dc_url_from_env())).replace("__DOCKER_NOTE__", docker_note)
             .replace("__LOCAL_DIR__", escape(default_local_dir()))
             .replace("__KEEP__", f"{subset.SAMPLE_PCT:g}").replace("__MIN__", str(subset.MIN_COMMITS)))
 
@@ -141,6 +142,22 @@ class Handler(BaseHTTPRequestHandler):
                 return
             items = [t.full_name for t in subset.discover_local_repos(root)]
             self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": items}))
+            return
+
+        if path == "/detect" and one("platform") == plastic.PLATFORM:
+            # Plastic SCM: listed with the cm client's own login, so no token here
+            try:
+                found = plastic.list_repos(one("host"))
+            except plastic.PlasticError as exc:
+                self.respond(HTTPStatus.BAD_REQUEST, "application/json", json.dumps({"error": str(exc)}))
+                return
+            with LOCK:
+                STATE["detected"] = {k: v for k, v in STATE["detected"].items() if v.platform != plastic.PLATFORM}
+                STATE["detected"].update({t.key: t for t in found})
+                items = [{"key": t.key, "name": t.full_name, "platform": t.platform}
+                         for t in STATE["detected"].values()]
+            items.sort(key=lambda i: (i["platform"], i["name"].lower()))
+            self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": items, "found": len(found)}))
             return
 
         if path == "/detect":
@@ -271,13 +288,14 @@ __DOCKER_NOTE__
 <div id="picker" class="picks"></div><p class="small">Tick the repos to sample. Nothing ticked = every repo found.</p></div>
 <hr>
 <label class="f">Or detect remote repos with an access token</label>
-<div class="row"><div><label class="f">Platform</label><select name="platform" id="platform"><option value="github">GitHub</option><option value="gitlab">GitLab</option><option value="bitbucket">Bitbucket Cloud</option><option value="bitbucket_dc">Bitbucket Data Center</option></select></div>
+<div class="row"><div><label class="f">Platform</label><select name="platform" id="platform"><option value="github">GitHub</option><option value="gitlab">GitLab</option><option value="bitbucket">Bitbucket Cloud</option><option value="bitbucket_dc">Bitbucket Data Center</option><option value="plastic">Unity Version Control (Plastic SCM)</option></select></div>
 <div id="hostbox" class="hidden"><label class="f" id="hostlabel">Server URL</label><input type="text" name="host" id="host" value="__DC_URL__"></div>
 <div id="wsbox" class="hidden"><label class="f">Workspace (optional)</label><input type="text" name="workspace" placeholder="blank = repos you are a member of"></div></div>
-<div class="row"><div style="flex:3"><label class="f">Access token</label><input type="password" name="token" autocomplete="off" placeholder="blank = use GH_TOKEN / GITLAB_TOKEN / BITBUCKET_TOKEN / BITBUCKET_DC_TOKEN or the tokens file"></div>
+<div class="row"><div style="flex:3" id="tokbox"><label class="f">Access token</label><input type="password" name="token" autocomplete="off" placeholder="blank = use GH_TOKEN / GITLAB_TOKEN / BITBUCKET_TOKEN / BITBUCKET_DC_TOKEN or the tokens file"></div>
 <div style="flex:0;align-self:flex-end"><button class="sec" id="detect" type="button">Detect repos</button></div></div>
 <label class="small" id="tlsbox" style="display:none"><input type="checkbox" name="insecure"> Skip TLS verification (self-signed server only; this disables certificate checks)</label>
-<p class="small">The token is kept in memory for this session only. Detection lists every repo the token can see. Run it again for another platform; results are combined below.</p>
+<p class="small" id="toknote">The token is kept in memory for this session only. Detection lists every repo the token can see. Run it again for another platform; results are combined below.</p>
+<p class="small hidden" id="plasticnote">Plastic SCM uses the <code>cm</code> client's own login (<code>cm configure</code> or a <code>cm profile</code>), not a token. Each ticked repo is exported with <code>cm fast-export</code>, imported into git and sampled from its <code>/main</code> branch. A folder above can also hold Plastic workspaces or <code>.fe</code> export files.</p>
 <div id="rpickwrap" class="hidden"><div class="row"><input type="text" id="rfilter" placeholder="Filter by name" style="flex:2"><button class="sec" type="button" id="rall">Tick shown</button><button class="sec" type="button" id="rnone">Clear</button><span class="small" id="rcount"></span></div>
 <div id="rpicker" class="picks"></div>
 <p class="small">Unlike local repos, <b>nothing ticked here means none</b>: detected lists can hold thousands of repos.</p></div></div>
@@ -328,9 +346,11 @@ $('#go').onclick=async()=>{
   const t=await r.text(); if(!r.ok){$('#msg').innerHTML='<span class="err">'+esc(t)+'</span>';return;}
   $('#runcard').classList.remove('hidden'); $('#done').classList.add('hidden'); poll(); };
 $('#dl').onclick=()=>{location.href='/download';};
-const PLAT={github:['',''],gitlab:['Host (blank = gitlab.com)','https://gitlab.example.com'],bitbucket:['',''],bitbucket_dc:['Server URL','https://bitbucket.example.com']};
-function platUi(){ const p=$('#platform').value;
-  $('#hostbox').classList.toggle('hidden',!(p==='gitlab'||p==='bitbucket_dc')); $('#wsbox').classList.toggle('hidden',p!=='bitbucket');
+const PLAT={github:['',''],gitlab:['Host (blank = gitlab.com)','https://gitlab.example.com'],bitbucket:['',''],bitbucket_dc:['Server URL','https://bitbucket.example.com'],plastic:['Plastic server','myserver:8087 or myorg@cloud']};
+function platUi(){ const p=$('#platform').value, pl=p==='plastic';
+  $('#hostbox').classList.toggle('hidden',!(p==='gitlab'||p==='bitbucket_dc'||pl));
+  $('#tokbox').style.visibility=pl?'hidden':''; $('#toknote').classList.toggle('hidden',pl); $('#plasticnote').classList.toggle('hidden',!pl);
+  if(pl&&$('#host').value===__DC_URL_JS__) $('#host').value=''; $('#wsbox').classList.toggle('hidden',p!=='bitbucket');
   $('#hostlabel').textContent=PLAT[p][0]||'Host'; $('#host').placeholder=PLAT[p][1];
   $('#tlsbox').style.display=(p==='gitlab'||p==='bitbucket_dc')?'block':'none'; }
 $('#platform').onchange=platUi; platUi();

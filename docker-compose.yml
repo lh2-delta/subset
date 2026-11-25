@@ -16,3 +16,29 @@ services:
       - ./outputs:/app/outputs
       - ${LOCAL_REPOS_DIR:-./repos}:/data/repos:ro
     restart: unless-stopped
+
+  # Same UI with the Plastic SCM client `cm` installed: `docker compose --profile plastic up --build subset-plastic`.
+  # cm is amd64-only (runs under emulation on Apple silicon). Log in once:
+  #   docker compose --profile plastic run --rm subset-plastic cm configure
+  # (or `cm profile create ...`); the login is kept in ./secrets/plastic4 on your computer.
+  subset-plastic:
+    profiles: ["plastic"]
+    build:
+      context: .
+      args:
+        PLASTIC: "1"
+    platform: linux/amd64
+    ports:
+      - "${UI_PORT:-8768}:8768"
+    environment:
+      SUBSET_DOCKER: "1"
+      DEFAULT_LOCAL_REPOS_DIR: /data/repos
+      DEFAULT_TOKENS_FILE: /app/secrets/tokens
+      PYTHONUNBUFFERED: "1"
+      BITBUCKET_DC_URL: "${BITBUCKET_DC_URL:-}"
+    volumes:
+      - ./secrets:/app/secrets:ro
+      - ./secrets/plastic4:/root/.plastic4
+      - ./outputs:/app/outputs
+      - ${LOCAL_REPOS_DIR:-./repos}:/data/repos:ro
+    restart: unless-stopped

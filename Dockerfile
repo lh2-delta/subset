@@ -3,8 +3,17 @@ FROM python:3.11-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# PLASTIC=1 adds the Unity Version Control (Plastic SCM) client `cm` (amd64 only; see the subset-plastic service).
+ARG PLASTIC=0
+COPY docker/install-plastic-cm.sh /tmp/install-plastic-cm.sh
+RUN if [ "$PLASTIC" = "1" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends curl gnupg \
+      && sh /tmp/install-plastic-cm.sh && apt-get purge -y curl gnupg && apt-get autoremove -y \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi; rm -f /tmp/install-plastic-cm.sh
+
 WORKDIR /app
-COPY subset.py subset_ui.py sampler.py repo_discovery.py LH2-DataLabs.svg ./
+COPY subset.py subset_ui.py sampler.py repo_discovery.py plastic.py LH2-DataLabs.svg ./
 RUN mkdir -p /app/outputs /data/repos
 
 ENV SUBSET_DOCKER=1 \
