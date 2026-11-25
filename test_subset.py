@@ -19,6 +19,7 @@ from pathlib import Path
 
 import sampler
 import subset
+import plastic
 import repo_discovery
 import subset_ui
 
@@ -546,6 +547,132 @@ class UiTests(Base):
         self.assertEqual((snap["progress"]["sampled"], snap["progress"]["skipped"]), (1, 0))
         zipped = urllib.request.urlopen(self.base + "/download").read()
         self.assertTrue(zipped.startswith(b"PK"))
+
+
+FAKE_CM = r"""#!/usr/bin/env python3
+import os, shutil, sys
+a = sys.argv[1:]
+store = os.environ["FAKE_CM_STORE"]
+if a[:2] == ["repo", "list"]:
+    if a[2] == "down:8087":
+        sys.exit("Error: Connection refused")
+    print("game\nengine@" + a[2])
+elif a[0] == "fast-export":
+    name = a[1].split("@", 1)[0]
+    src = os.path.join(store, name + ".fe")
+    if not os.path.exists(src):
+        sys.exit("Error: The repository '" + name + "' does not exist.")
+    shutil.copy(src, a[2])
+else:
+    sys.exit("Error: unknown command")
+"""
+
+
+def make_export(repo: Path, out: Path, branch: str = "master") -> Path:
+    """A `cm fast-export`-like stream: Plastic's /main arrives as `branch`, plus a child branch."""
+    git(repo, "branch", "-m", branch)
+    git(repo, "branch", "main-task001")
+    out.write_bytes(subprocess.run(["git", "fast-export", "--all"], cwd=repo, check=True, capture_output=True).stdout)
+    return out
+
+
+class PlasticTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.store = self.tmp / "plastic-store"
+        self.store.mkdir()
+        make_export(make_repo(self.tmp / "src-game", 40), self.store / "game.fe")
+        make_export(make_repo(self.tmp / "src-engine", 25), self.store / "engine.fe", branch="main")
+        make_export(make_repo(self.tmp / "src-odd", 30), self.store / "odd.fe", branch="trunk-only")
+        cm = self.tmp / "bin" / "cm"
+        cm.parent.mkdir()
+        cm.write_text(FAKE_CM)
+        cm.chmod(0o755)
+        patcher = unittest.mock.patch.dict(os.environ, {"PLASTIC_CM": str(cm), "FAKE_CM_STORE": str(self.store)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_job(self, targets):
+        return subset.run_job(targets, pct=5, min_commits=20, workers=2, output_dir=self.tmp / "out")
+
+    def test_parse_repspec(self):
+        t = plastic.parse_repspec("game@plastic.example.com:8087")
+        self.assertEqual((t.full_name, t.clone_url, t.platform),
+                         ("plastic.example.com:8087/game", "game@plastic.example.com:8087", "plastic"))
+        self.assertEqual(plastic.parse_repspec("rep:art@studio@cloud").clone_url, "art@studio@cloud")
+        for bad in ("game", "@server", "a b@c", ""):
+            with self.assertRaises(ValueError):
+                plastic.parse_repspec(bad)
+
+    def test_server_repo_is_exported_imported_and_sampled(self):
+        result = self.run_job([plastic.parse_repspec("game@srv:8087"), plastic.parse_repspec("engine@srv:8087")])
+        report = result["report"]
+        self.assertEqual({e["repo"]: e["sampled_commits"] for e in report["sampled"]},
+                         {"srv:8087/game": 2, "srv:8087/engine": 2})
+        out = result["run_dir"] / "samples" / "srv__8087__game"
+        manifest = json.loads((out / "SAMPLE_MANIFEST.json").read_text())
+        self.assertEqual((manifest["source_vcs"], manifest["plastic_repspec"], manifest["total_commits"]),
+                         ("plastic", "game@srv:8087", 40))
+        self.assertEqual(manifest["branch_sampled"], "master")
+        self.assertEqual(git(out, "for-each-ref", "--format=%(refname)"), "refs/heads/sample5pct")  # child branch gone
+        self.assertEqual(git(out, "fsck", "--full"), "")
+        self.assertFalse((result["run_dir"] / "clones").exists())  # export files and imports cleaned up
+
+    def test_failures_are_logged_not_raised(self):
+        result = self.run_job([plastic.parse_repspec("ghost@srv:8087"), plastic.parse_repspec("odd@srv:8087")])
+        reasons = {e["repo"]: e["reason"] for e in result["report"]["skipped"]}
+        self.assertIn("does not exist", reasons["srv:8087/ghost"])
+        self.assertIn("no main branch", reasons["srv:8087/odd"])
+        with unittest.mock.patch.dict(os.environ, {"PLASTIC_CM": str(self.tmp / "no-such-cm")}):
+            result = self.run_job([plastic.parse_repspec("game@srv:8087")])
+        self.assertIn("`cm` is not installed", result["report"]["skipped"][0]["reason"])
+
+    def test_list_repos(self):
+        self.assertEqual([t.full_name for t in plastic.list_repos("srv:8087")], ["srv:8087/engine", "srv:8087/game"])
+        with self.assertRaisesRegex(plastic.PlasticError, "Connection refused"):
+            plastic.list_repos("down:8087")
+        with self.assertRaises(plastic.PlasticError):
+            plastic.list_repos(" ")
+
+    def test_local_folder_finds_workspaces_and_export_files(self):
+        shutil.copy(self.store / "game.fe", self.repos / "acme" / "game.fe")
+        ws = self.repos / "studio" / "engine-ws"
+        (ws / ".plastic").mkdir(parents=True)
+        (ws / ".plastic" / "plastic.selector").write_text('repository "engine@srv:8087"\n  path "/"\n    smartbranch "/main"\n')
+        bare = self.repos / "studio" / "no-selector"
+        (bare / ".plastic").mkdir(parents=True)
+        (self.repos / "notes.fe").write_text("not a stream")
+        found = {t.full_name: t for t in subset.discover_local_repos(self.repos)}
+        self.assertEqual(sorted(found), ["acme/big", "acme/game", "acme/small", "solo", "studio/engine-ws", "studio/no-selector"])
+        self.assertEqual((found["acme/game"].platform, found["studio/engine-ws"].clone_url),
+                         ("plastic_export", "engine@srv:8087"))
+        report = self.run_job([found["acme/game"], found["studio/engine-ws"], found["studio/no-selector"]])["report"]
+        self.assertEqual(sorted(e["repo"] for e in report["sampled"]), ["acme/game", "studio/engine-ws"])
+        self.assertIn("plastic.selector", report["skipped"][0]["reason"])
+        self.assertTrue((self.repos / "acme" / "game.fe").is_file())  # the user's file is never moved
+
+    def test_cli_plastic_options(self):
+        out = self.tmp / "cli-out"
+        self.assertEqual(subset.main(["--plastic-export", str(self.store / "game.fe"), "--output-dir", str(out)]), 0)
+        self.assertEqual(subset.main(["--plastic", "engine@srv:8087", "--output-dir", str(out)]), 0)
+        self.assertEqual(subset.main(["--plastic", "nonsense", "--output-dir", str(out)]), 2)
+        self.assertEqual(subset.main(["--plastic-export", str(self.tmp / "missing.fe"), "--output-dir", str(out)]), 2)
+        out2 = self.tmp / "cli-out2"  # run folders are named per second, so keep this run apart
+        self.assertEqual(subset.main(["--plastic-server", "srv:8087", "--repo", "game", "--output-dir", str(out2)]), 0)
+        report = json.loads(next(out2.glob("subset-*/samples/sampling_report.json")).read_text())
+        self.assertEqual([e["repo"] for e in report["sampled"]], ["srv:8087/game"])
+        self.assertEqual(subset.main(["--plastic-server", "down:8087", "--output-dir", str(out)]), 2)
+
+    def test_ui_detects_plastic_without_token(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), subset_ui.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        subset_ui.STATE.update(detected={}, running=False, progress={}, error=None)
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        data = urllib.parse.urlencode({"csrf_token": subset_ui.CSRF_TOKEN, "platform": "plastic", "host": "srv:8087"}).encode()
+        body = json.loads(urllib.request.urlopen(urllib.request.Request(base + "/detect", data=data)).read())
+        self.assertEqual([i["key"] for i in body["items"]], ["plastic|srv:8087/engine", "plastic|srv:8087/game"])
+        self.assertIn("Plastic SCM", urllib.request.urlopen(base + "/").read().decode())
 
 
 if __name__ == "__main__":

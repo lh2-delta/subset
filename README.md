@@ -1,7 +1,7 @@
 # subset (version 1.0.0)
 
 Keep only the **first 5% of each repo's commit history** and package the results as a zip.
-Sampling only: no metrics, no profiling. Network use is limited to listing repos with your token and `git clone`.
+Sampling only: no metrics, no profiling. Network use is limited to listing repos with your token, `git clone`, and `cm` for Plastic SCM servers.
 
 Use it when you already know which repos you want a history sample of and don't need any
 metrics about them.
@@ -138,6 +138,36 @@ Never commit `tokens`, `secrets/` or `.env`.
 
 `--remote owner/repo`, `--remote https://...` or `--remote-file F` still work for a handful of
 public or known repos. They are not in the UI any more.
+
+## Unity Version Control (Plastic SCM)
+
+Plastic repos are sampled the same way as git repos: the history is turned into a git repo first, then the first 5% of
+commits of Plastic's `/main` branch is kept (repos under 20 changesets on `/main` are skipped). Each Plastic changeset becomes one
+git commit (message `Changeset: N <comment>`); child branches, labels and other refs are removed as usual.
+`SAMPLE_MANIFEST.json` adds `"source_vcs": "plastic"` and the repo spec or export file name.
+
+Three ways in:
+
+| Input | Needs `cm`? | How |
+|---|---|---|
+| A repo on a Plastic server | yes | CLI `--plastic name@server:8087` (Cloud: `name@org@cloud`); UI: platform **Unity Version Control (Plastic SCM)**, enter the server, **Detect repos**, tick. CLI for all repos: `--plastic-server server:8087` (`--list-only` to look first, `--repo` to narrow). |
+| A Plastic workspace folder (has `.plastic/`) | yes | Put it under the local folder; the repo is read from `.plastic/plastic.selector` and exported from its server. The folder itself holds no history. |
+| A file made with `cm fast-export repo@server file.fe` | no | Put the `.fe` file under the local folder (it is listed like a repo), or CLI `--plastic-export file.fe`. Easiest when the client runs the export. |
+
+How a server repo is read: `cm fast-export <repspec> <file>` then `git fast-import`, in the run's scratch folder; the export file
+is deleted afterwards. The whole history is exported (Plastic changeset numbers span all branches, so the cut is made after import).
+
+**The `cm` client.** Plastic lists and exports with `cm`'s own login, not a token from this tool. Without Docker, install Unity
+Version Control and sign in (`cm configure`, or a `cm profile`); `PLASTIC_CM` can point at a `cm` that is not on `PATH`. With
+Docker use the `subset-plastic` service, which adds `cm` to the image (amd64 only; it runs under emulation on Apple silicon):
+
+```bash
+docker compose --profile plastic run --rm subset-plastic cm configure   # once; kept in ./secrets/plastic4
+docker compose --profile plastic up --build subset-plastic              # UI on http://localhost:8768
+```
+
+Run either `subset` or `subset-plastic`, not both (same port). The image installs `cm` with
+`docker/install-plastic-cm.sh`, which checks the vendor's signed `Release`, then the `Packages` and `.deb` checksums.
 
 ## Settings (`.env`)
 

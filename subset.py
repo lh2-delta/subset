@@ -2,8 +2,12 @@
 """subset: sample the first N% of commit history of many repos. Sampling only, no metrics.
 
 Sources:
-  --local-repos-dir DIR   every git repo found under DIR (copied, never modified)
+  --local-repos-dir DIR   every git repo found under DIR (copied, never modified), plus Plastic SCM workspaces
+                          (.plastic/) and Plastic fast-export files (*.fe)
   --remote SPEC           owner/repo, or a github/gitlab/bitbucket URL (cloned in full, then sliced)
+  --plastic SPEC          a Unity Version Control (Plastic SCM) repo: name@server:port or name@org@cloud (needs cm)
+  --plastic-server S      every repo on a Plastic server (needs cm; narrow with --repo)
+  --plastic-export FILE   a `cm fast-export` file made elsewhere (no cm needed)
 
 Usage:
   python subset.py --local-repos-dir ./repos
@@ -11,6 +15,9 @@ Usage:
   python subset.py --remote acme/widgets --remote https://gitlab.com/grp/proj
   python subset.py --discover bitbucket-dc --host https://bitbucket.example.com --list-only
   python subset.py --discover github --repo alpha   # token from env/tokens file
+  python subset.py --plastic game@plastic.example.com:8087
+  python subset.py --plastic-server myorg@cloud --list-only
+  python subset.py --plastic-export ./game.fe
   python subset.py --ui                       # browser UI on http://127.0.0.1:8768
 
 Output: outputs/subset-<stamp>/ with samples/<org__repo>/, samples/sampling_log.jsonl,
@@ -35,6 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
+import plastic
 import repo_discovery
 import sampler
 from repo_discovery import Target
@@ -61,26 +69,38 @@ DC_KEY_RE = re.compile(r"data_?center|(^|[_-])(dc|server)([_-]|$)")
 # ── discovery / parsing ─────────────────────────────────────────────────────
 
 def discover_local_repos(root: Path) -> list[Target]:
-    """Git working trees under root (depth <= 3). Does not descend into a repo."""
+    """Repos under root (depth <= 3): git working trees, Plastic SCM workspaces (.plastic/, exported from their server
+    with cm) and Plastic fast-export files (*.fe). Does not descend into a repo or workspace."""
     root = root.resolve()
     found: list[Target] = []
 
+    def rel_name(path: Path) -> str:
+        rel = path.relative_to(root).as_posix()
+        return rel if rel != "." else path.name
+
     def walk(directory: Path, depth: int) -> None:
         if (directory / ".git").exists():
-            rel = directory.relative_to(root).as_posix()
-            found.append(Target(full_name=rel if rel != "." else directory.name, local_path=directory))
+            found.append(Target(full_name=rel_name(directory), local_path=directory))
             return
-        if depth >= MAX_DISCOVERY_DEPTH:
+        if (directory / ".plastic").is_dir():
+            # the history is on the Plastic server, not in the folder; no repspec -> logged as not sampled later
+            found.append(Target(full_name=rel_name(directory), clone_url=plastic.workspace_repspec(directory),
+                                platform=plastic.PLATFORM))
             return
         try:
-            children = sorted(p for p in directory.iterdir() if p.is_dir() and not p.name.startswith("."))
+            entries = sorted(directory.iterdir())
         except OSError:
             return
-        for child in children:
+        for f in entries:
+            if not f.name.startswith(".") and plastic.is_export_file(f):
+                found.append(plastic.export_target(rel_name(f.with_suffix("")), f))
+        if depth >= MAX_DISCOVERY_DEPTH:
+            return
+        for child in (p for p in entries if p.is_dir() and not p.name.startswith(".")):
             walk(child, depth + 1)
 
     walk(root, 0)
-    return found
+    return sorted(found, key=lambda t: t.full_name)
 
 
 def resolve_local_selectors(root: Path, selectors: list[str]) -> list[Target]:
@@ -280,6 +300,33 @@ def zip_run_dir(run_dir: Path) -> Path:
     return zip_path
 
 
+def sample_plastic(target: Target, run_dir: Path, pct: float, min_commits: int, timeout: int,
+                   log: logging.Logger) -> bool:
+    """Turn a Plastic repo (server repo or fast-export file) into git, then sample it like any repo."""
+    clone = run_dir / "clones" / target.slug
+    extra = {"source_vcs": "plastic"}
+    try:
+        if target.platform == "plastic_export":
+            extra["plastic_export_file"] = target.local_path.name
+            log.info("PLASTIC %s: importing %s", target.full_name, target.local_path.name)
+            plastic.import_stream(target.local_path, clone)
+        else:
+            if not target.clone_url:
+                raise plastic.PlasticError("Plastic workspace without a readable repo in .plastic/plastic.selector")
+            extra["plastic_repspec"] = target.clone_url
+            log.info("PLASTIC %s: cm fast-export %s", target.full_name, target.clone_url)
+            plastic.export_repo(target.clone_url, clone, run_dir / "clones" / ".plastic-export", timeout)
+    except (plastic.PlasticError, OSError, subprocess.TimeoutExpired) as exc:
+        shutil.rmtree(clone, ignore_errors=True)
+        sampler.log_skip(run_dir, target.full_name, target.slug, f"Plastic export failed: {exc}", log)
+        return False
+    try:
+        return sampler.take_sample(repo_name=target.full_name, slug=target.slug, source=clone, disposable=True,
+                                   run_dir=run_dir, pct=pct, min_commits=min_commits, log=log, extra_manifest=extra)
+    finally:
+        shutil.rmtree(clone, ignore_errors=True)
+
+
 def run_job(
     targets: list[Target],
     *,
@@ -315,6 +362,8 @@ def run_job(
             if not sampler.is_selected(repo_filter, target.full_name):
                 sampler.log_skip(run_dir, target.full_name, target.slug,
                                  f"not in the selected sample list ({sampler.REPOS_ENV})", log)
+            elif target.platform in (plastic.PLATFORM, "plastic_export"):
+                ok = sample_plastic(target, run_dir, pct, min_commits, clone_timeout, log)
             elif target.local_path is not None:
                 ok = sampler.take_sample(
                     repo_name=target.full_name, slug=target.slug, source=target.local_path,
@@ -380,8 +429,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workspace", default="", help="--discover bitbucket: workspace (default: repos you are a member of)")
     ap.add_argument("--insecure-tls", action="store_true",
                     help="skip TLS certificate checks for discovery and clones (self-signed servers only)")
-    ap.add_argument("--list-only", action="store_true", help="--discover: print the repos found and exit")
+    ap.add_argument("--list-only", action="store_true",
+                    help="--discover / --plastic-server: print the repos found and exit")
     ap.add_argument("--tokens-file", type=Path, default=HERE / "tokens")
+    ap.add_argument("--plastic", action="append", default=[],
+                    help="Unity Version Control (Plastic SCM) repo: name@server:port or name@org@cloud (repeatable; needs cm)")
+    ap.add_argument("--plastic-server", default="",
+                    help="sample every repo on this Plastic server (host:port or org@cloud; needs cm; narrow with --repo)")
+    ap.add_argument("--plastic-export", action="append", type=Path, default=[],
+                    help="a file written by `cm fast-export` (repeatable; no cm needed)")
     ap.add_argument("--repo", action="append", default=[],
                     help="only sample this repo (org/repo or bare name; repeatable). Default: all found")
     ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="repos processed in parallel")
@@ -410,6 +466,28 @@ def main(argv: list[str] | None = None) -> int:
             print("\n".join(t.full_name for t in found))
             return 0
         targets += found
+    if args.plastic_server:
+        try:
+            found = plastic.list_repos(args.plastic_server)
+        except plastic.PlasticError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(f"found {len(found)} repo(s) on Plastic server {args.plastic_server}", flush=True)
+        if args.list_only:
+            print("\n".join(t.full_name for t in found))
+            return 0
+        targets += found
+    for spec in args.plastic:
+        try:
+            targets.append(plastic.parse_repspec(spec))
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    for path in args.plastic_export:
+        if not plastic.is_export_file(path):
+            print(f"error: not a cm fast-export file (*.fe holding a git fast-import stream): {path}", file=sys.stderr)
+            return 2
+        targets.append(plastic.export_target(path.resolve().stem, path.resolve()))
     if args.local_repos_dir:
         if not args.local_repos_dir.is_dir():
             print(f"error: not a directory: {args.local_repos_dir}", file=sys.stderr)
@@ -438,7 +516,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
     if not targets:
-        print("error: no repos found; give --local-repos-dir, --repo-path, --remote or --discover", file=sys.stderr)
+        print("error: no repos found; give --local-repos-dir, --repo-path, --remote, --discover or a --plastic option",
+              file=sys.stderr)
         return 2
 
     result = run_job(
