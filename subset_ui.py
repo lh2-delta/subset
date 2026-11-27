@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import secrets
@@ -51,13 +52,14 @@ def snapshot() -> dict:
     return out
 
 
-def start_job(targets: list[subset.Target], tokens: dict[str, str], insecure_tls: bool = False) -> None:
+def start_job(targets: list[subset.Target], tokens: dict[str, str], insecure_tls: bool = False,
+              branch: str | None = None) -> None:
     progress: dict = {}
 
     def runner() -> None:
         try:
             subset.run_job(targets, output_dir=subset.DEFAULT_OUTPUT, tokens=tokens, insecure_tls=insecure_tls,
-                           progress=progress)
+                           progress=progress, branch=branch)
         except Exception as exc:  # surfaced in the UI; the server keeps running
             with LOCK:
                 STATE["error"] = subset.redact(str(exc), tokens)[:500]
@@ -144,6 +146,30 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(HTTPStatus.OK, "application/json", json.dumps({"items": items}))
             return
 
+        if path == "/branches":
+            # One repo's branches for the per-repo picker; fetched only when its "branch" button is clicked.
+            with LOCK:
+                detected = dict(STATE["detected"])
+                tokens = {**subset.parse_tokens_file(tokens_file_path()), **STATE["detect_tokens"]}
+                insecure_by_platform = dict(STATE["detect_insecure"])
+            if one("kind") == "local":
+                root = Path(one("local_dir")).expanduser()
+                target = next((t for t in subset.discover_local_repos(root) if t.full_name == one("name")),
+                              None) if root.is_dir() else None
+            else:
+                target = detected.get(one("key"))
+            if target is None:
+                self.respond(HTTPStatus.BAD_REQUEST, "application/json", json.dumps({"error": "Unknown repo."}))
+                return
+            try:
+                names, default = subset.list_branches(target, tokens, bool(insecure_by_platform.get(target.platform)))
+            except (RuntimeError, OSError) as exc:  # PlasticError is a RuntimeError
+                self.respond(HTTPStatus.BAD_REQUEST, "application/json",
+                             json.dumps({"error": subset.redact(str(exc), tokens)[:400]}))
+                return
+            self.respond(HTTPStatus.OK, "application/json", json.dumps({"branches": names, "default": default}))
+            return
+
         if path == "/detect" and one("platform") == plastic.PLATFORM:
             # Plastic SCM: listed with the cm client's own login, so no token here
             try:
@@ -193,6 +219,16 @@ class Handler(BaseHTTPRequestHandler):
         def bad(msg: str) -> None:
             self.respond(HTTPStatus.BAD_REQUEST, "text/plain", msg)
 
+        try:
+            branch = sampler.normalise_branch(one("branch"))
+            per_repo = {k: sampler.normalise_branch(v[0]) for k, v in fields.items()
+                        if k.startswith(("lbranch:", "rbranch:")) and v and v[0].strip()}
+        except sampler.SampleConfigError as exc:
+            return bad(str(exc))
+
+        def with_branch(t: subset.Target, field: str) -> subset.Target:
+            return dataclasses.replace(t, branch=per_repo[field]) if per_repo.get(field) else t
+
         targets: list[subset.Target] = []
         if one("local_dir"):
             root = Path(one("local_dir")).expanduser()
@@ -200,12 +236,12 @@ class Handler(BaseHTTPRequestHandler):
                 return bad(f"Not a folder: {root}")
             found = subset.discover_local_repos(root)
             ticked = {v.strip() for v in fields.get("local_repos", []) if v.strip()}
-            targets += [t for t in found if not ticked or t.full_name in ticked]
+            targets += [with_branch(t, f"lbranch:{t.full_name}") for t in found if not ticked or t.full_name in ticked]
         with LOCK:
             detected = dict(STATE["detected"])
             tokens = {**subset.parse_tokens_file(tokens_file_path()), **STATE["detect_tokens"]}
             insecure_by_platform = dict(STATE["detect_insecure"])
-        remote = [detected[k] for k in fields.get("remote_repos", []) if k in detected]
+        remote = [with_branch(detected[k], f"rbranch:{k}") for k in fields.get("remote_repos", []) if k in detected]
         targets += remote
         if not targets:
             return bad("Nothing to sample: pick a local folder with repos, or detect and tick remote repos.")
@@ -215,7 +251,7 @@ class Handler(BaseHTTPRequestHandler):
             if STATE["running"]:
                 self.respond(HTTPStatus.CONFLICT, "text/plain", "A run is already in progress.")
                 return
-        start_job(targets, tokens, insecure_tls)
+        start_job(targets, tokens, insecure_tls, branch)
         self.respond(HTTPStatus.OK, "application/json", json.dumps({"ok": True, "repos": len(targets)}))
 
 
@@ -270,6 +306,8 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;p
 th{font:500 10.5px var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
 .picks details{border-bottom:1px solid var(--border)}.picks summary{cursor:pointer;padding:7px 0;list-style-position:inside}.picks details label{display:flex;gap:10px;padding:3px 0 3px 28px}.picks .gc{margin-left:6px}
 hr{border:0;border-top:1px solid var(--border);margin:22px 0}details>summary.small{cursor:pointer}
+.picks .br{margin-left:auto;padding-left:10px;white-space:nowrap}.picks .br select,.picks .br input{width:auto;max-width:240px;padding:2px 8px;font:12px var(--mono);border-radius:6px}
+button.brbtn{padding:1px 10px;font:500 11.5px var(--mono);background:transparent;color:var(--muted);border-color:var(--hair)}button.brbtn:hover{color:#fff;background:transparent}
 #msg{margin-left:14px}.hidden{display:none}code{font:12.5px var(--mono);background:var(--surface);padding:1px 6px;border-radius:5px}
 @media (max-width:600px){.card{padding:18px}.top{margin-bottom:28px}}
 </style></head><body><main>
@@ -295,10 +333,14 @@ __DOCKER_NOTE__
 <div style="flex:0;align-self:flex-end"><button class="sec" id="detect" type="button">Detect repos</button></div></div>
 <label class="small" id="tlsbox" style="display:none"><input type="checkbox" name="insecure"> Skip TLS verification (self-signed server only; this disables certificate checks)</label>
 <p class="small" id="toknote">The token is kept in memory for this session only. Detection lists every repo the token can see. Run it again for another platform; results are combined below.</p>
-<p class="small hidden" id="plasticnote">Plastic SCM uses the <code>cm</code> client's own login (<code>cm configure</code> or a <code>cm profile</code>), not a token. Each ticked repo is exported with <code>cm fast-export</code>, imported into git and sampled from its <code>/main</code> branch. A folder above can also hold Plastic workspaces or <code>.fe</code> export files.</p>
+<p class="small hidden" id="plasticnote">Plastic SCM uses the <code>cm</code> client's own login (<code>cm configure</code> or a <code>cm profile</code>), not a token. Each ticked repo is exported with <code>cm fast-export</code>, imported into git and sampled from its <code>/main</code> branch (or the branch you pick below). A folder above can also hold Plastic workspaces or <code>.fe</code> export files.</p>
 <div id="rpickwrap" class="hidden"><div class="row"><input type="text" id="rfilter" placeholder="Filter by name" style="flex:2"><button class="sec" type="button" id="rall">Tick shown</button><button class="sec" type="button" id="rnone">Clear</button><span class="small" id="rcount"></span></div>
 <div id="rpicker" class="picks"></div>
-<p class="small">Unlike local repos, <b>nothing ticked here means none</b>: detected lists can hold thousands of repos.</p></div></div>
+<p class="small">Unlike local repos, <b>nothing ticked here means none</b>: detected lists can hold thousands of repos.</p></div>
+<hr>
+<label class="f">Branch (optional)</label>
+<input type="text" name="branch" id="branch" placeholder="blank = each repo's default branch (Plastic: /main)">
+<p class="small">Applies to every repo, except one you set with its <b>branch</b> button in the lists above (that lists the repo's branches). A repo without the branch is listed as not sampled; it is never swapped for its default branch.</p></div>
 <button id="go" type="button">Create samples</button> <span id="msg"></span></form>
 <div class="card hidden" id="runcard" style="margin-top:16px"><h2>Progress</h2><div class="bar"><i id="bar"></i></div>
 <div id="stats" class="small"></div><pre id="log"></pre>
@@ -308,7 +350,22 @@ __DOCKER_NOTE__
 const $=s=>document.querySelector(s), csrf=$('[name=csrf_token]').value;
 const post=(p,d)=>fetch(p,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:d});
 const esc=t=>String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const openSets={};
+const openSets={}, brOpts={}, brSel={};
+// Per-repo branch: a "branch" button that, once clicked, fetches the repo's branches and becomes a dropdown
+// (a text box when the branches can't be listed, e.g. a Plastic .fe file). Blank = the global Branch field / default.
+function brCtl(k,v){ const id=k+'|'+v, o=brOpts[id], nm=(k==='l'?'lbranch:':'rbranch:')+v, cur=brSel[id]||'';
+  if(!o) return '<span class="br"><button type="button" class="sec brbtn" data-k="'+k+'" data-v="'+esc(v)+'">branch</button></span>';
+  const dflt='default'+(o.default?' ('+o.default+')':'');
+  if(!o.branches.length) return '<span class="br"><input type="text" name="'+esc(nm)+'" data-id="'+esc(id)+'" value="'+esc(cur)+'" placeholder="'+esc(dflt)+'"></span>';
+  return '<span class="br"><select name="'+esc(nm)+'" data-id="'+esc(id)+'"><option value="">'+esc(dflt)+'</option>'+o.branches.map(b=>'<option value="'+esc(b)+'"'+(b===cur?' selected':'')+'>'+esc(b)+'</option>').join('')+'</select></span>'; }
+async function loadBranches(b){
+  const k=b.dataset.k, v=b.dataset.v, d=new URLSearchParams({csrf_token:csrf});
+  if(k==='l'){ d.set('kind','local'); d.set('local_dir',$('#local_dir').value); d.set('name',v); } else { d.set('kind','remote'); d.set('key',v); }
+  b.disabled=true; b.textContent='loading...';
+  try{ const r=await post('/branches',d), j=await r.json();
+    if(!r.ok){ $('#msg').innerHTML='<span class="err">'+esc(j.error)+'</span>'; b.textContent='branch'; return; }
+    brOpts[k+'|'+v]=j; b.parentNode.outerHTML=brCtl(k,v);
+  } finally { b.disabled=false; } }
 function syncGroup(d){ const boxes=[...d.querySelectorAll('label input')], n=boxes.filter(e=>e.checked).length, g=d.querySelector('.grp');
   g.checked=n>0&&n===boxes.length; g.indeterminate=n>0&&n<boxes.length; d.querySelector('.gc').textContent=n+' / '+boxes.length; }
 function syncAll(box){ box.querySelectorAll('details').forEach(syncGroup); }
@@ -320,13 +377,16 @@ function renderGroups(box,items,name,q,emptyMsg){
   const groups=new Map();
   items.filter(i=>!q||i.label.toLowerCase().includes(q)||keep.has(i.value)).forEach(i=>{ if(!groups.has(i.group)) groups.set(i.group,[]); groups.get(i.group).push(i); });
   if(!groups.size){ box.innerHTML='<span class="small">'+esc(emptyMsg)+'</span>'; return; }
-  box.innerHTML=[...groups].map(([g,list])=>'<details data-g="'+esc(g)+'"'+((q||open.has(g))?' open':'')+'><summary><input type="checkbox" class="grp" title="Tick all in this group"> <b>'+esc(g)+'</b> <span class="small gc"></span></summary>'+list.map(i=>'<label><input type="checkbox" name="'+name+'" value="'+esc(i.value)+'"'+(keep.has(i.value)?' checked':'')+'>'+esc(i.display)+(i.tag?' <span class="small">'+esc(i.tag)+'</span>':'')+'</label>').join('')+'</details>').join('');
+  box.innerHTML=[...groups].map(([g,list])=>'<details data-g="'+esc(g)+'"'+((q||open.has(g))?' open':'')+'><summary><input type="checkbox" class="grp" title="Tick all in this group"> <b>'+esc(g)+'</b> <span class="small gc"></span></summary>'+list.map(i=>'<label><input type="checkbox" name="'+name+'" value="'+esc(i.value)+'"'+(keep.has(i.value)?' checked':'')+'>'+esc(i.display)+(i.tag?' <span class="small">'+esc(i.tag)+'</span>':'')+brCtl(name==='local_repos'?'l':'r',i.value)+'</label>').join('')+'</details>').join('');
   syncAll(box); }
 function wireGroups(box,name,after){
   box.addEventListener('change',e=>{ const t=e.target, d=t.closest('details'); if(!d) return;
     if(t.classList.contains('grp')) d.querySelectorAll('label input').forEach(x=>x.checked=t.checked);
     syncGroup(d); after(); });
-  box.addEventListener('click',e=>{ if(e.target.classList.contains('grp')) e.stopPropagation(); }); }
+  box.addEventListener('click',e=>{ if(e.target.classList.contains('grp')) e.stopPropagation();
+    const b=e.target.closest('.brbtn'); if(b){ e.preventDefault(); e.stopPropagation(); loadBranches(b); } });
+  const keepBranch=e=>{ if(e.target.dataset.id) brSel[e.target.dataset.id]=e.target.value; };
+  box.addEventListener('change',keepBranch); box.addEventListener('input',keepBranch); }
 function setAll(box,name,val){ box.querySelectorAll('input[name='+name+']').forEach(e=>e.checked=val); syncAll(box); }
 function splitName(n,fallback){ const i=n.indexOf('/'); return i<0?[fallback,n]:[n.slice(0,i),n.slice(i+1)]; }
 let localItems=[];
@@ -335,6 +395,7 @@ function lrender(){ renderGroups($('#picker'),localItems,'local_repos','','No gi
 $('#load').onclick=async()=>{
   $('#msg').textContent=''; const r=await post('/discover',new URLSearchParams({csrf_token:csrf,local_dir:$('#local_dir').value}));
   const j=await r.json(); if(!r.ok){$('#msg').innerHTML='<span class="err">'+esc(j.error)+'</span>';return;}
+  Object.keys(brOpts).filter(k=>k.startsWith('l|')).forEach(k=>{ delete brOpts[k]; delete brSel[k]; });
   localItems=j.items.map(n=>{ const [g,d]=splitName(n,'(top level)'); return {value:n,label:n,group:g,display:d}; });
   $('#pickwrap').classList.remove('hidden'); lrender(); };
 wireGroups($('#picker'),'local_repos',count);

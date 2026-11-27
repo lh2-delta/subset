@@ -8,7 +8,9 @@ then sampled exactly like any other repo (first 5% of the main branch, same mani
   * a fast-export file someone made with ``cm fast-export`` (``*.fe``): imported the same way; no ``cm`` needed.
   * a Plastic workspace folder (has ``.plastic/``): its repo is read from the workspace selector and exported as above.
 
-Plastic's ``/main`` branch arrives as git ``master`` (or ``main``), which is what the sampler picks. Stdlib only.
+Plastic's ``/main`` branch arrives as git ``master`` (or ``main``), which is what the sampler picks. Another Plastic branch
+can be asked for (``/main/task001``): the export already holds every branch, so it is looked up among the imported git
+branches (see ``resolve_branch``); a branch that cannot be found is an error, never a silent fallback to ``/main``. Stdlib only.
 """
 
 from __future__ import annotations
@@ -120,8 +122,10 @@ def _git(args: list[str], cwd: Path, *, stdin=None, timeout: int = CM_TIMEOUT_SE
         raise PlasticError(f"git {args[0]} failed ({proc.returncode}): {err[-300:]}")
 
 
-def import_stream(stream: Path, dest: Path) -> None:
-    """Load a git fast-import stream into a new non-bare repo at dest, HEAD on Plastic's main branch."""
+def import_stream(stream: Path, dest: Path, require_main: bool = True) -> None:
+    """Load a git fast-import stream into a new non-bare repo at dest, HEAD on Plastic's main branch.
+
+    require_main=False (another branch was asked for) accepts an export without a main branch."""
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
@@ -133,13 +137,48 @@ def import_stream(stream: Path, dest: Path) -> None:
     if not heads:
         raise PlasticError("the fast-export stream holds no branch (empty repo?)")
     main = next((h for h in ("refs/heads/main", "refs/heads/master") if h in heads), None)
+    if main is None and not require_main:
+        return
     if main is None:
         raise PlasticError("no main branch in the export (Plastic /main should arrive as master or main); "
                            f"branches: {', '.join(h[len('refs/heads/'):] for h in heads[:5])}")
     _git(["symbolic-ref", "HEAD", main], dest)
 
 
-def export_repo(repspec: str, dest: Path, work: Path, timeout: int = CM_TIMEOUT_SECONDS) -> None:
+def _branch_candidates(requested: str) -> list[str]:
+    """Git branch names a Plastic branch may arrive as after cm fast-export (``/main/task001`` ->
+    ``main/task001``, ``main-task001``, ``task001``). Exact name first."""
+    name = requested.strip().lstrip("/")
+    parts = [p for p in name.split("/") if p]
+    out = [name, "-".join(parts), "/".join(parts[1:]) if parts[:1] == ["main"] else "", parts[-1] if parts else ""]
+    return [c for c in dict.fromkeys(out) if c]
+
+
+def resolve_branch(repo: Path, requested: str | None) -> str | None:
+    """The imported git branch to sample for a requested Plastic branch; None means Plastic's /main (the default).
+
+    Raises PlasticError naming the imported branches when nothing matches."""
+    name = (requested or "").strip().lstrip("/")
+    if not name or name == "main":
+        return None
+    heads = subprocess.run(["git", "for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd=str(repo),
+                           capture_output=True, text=True).stdout.split()
+    for cand in _branch_candidates(name):
+        if cand in heads:
+            return cand
+    shown = ", ".join(heads[:10]) + (f" (+{len(heads) - 10} more)" if len(heads) > 10 else "")
+    raise PlasticError(f"branch {requested!r} not found in the Plastic export (branches: {shown or 'none'})")
+
+
+def list_branches(repspec: str) -> list[str]:
+    """Branch names (``/main``, ``/main/task001``) of a repo on a Plastic server, via the logged-in cm."""
+    out = _cm(["find", "branch", "on", "repositories", f"'{repspec}'", "--format={name}", "--nototal"],
+              LIST_TIMEOUT_SECONDS).stdout
+    return sorted({ln.strip() for ln in out.splitlines() if ln.strip().startswith("/")})
+
+
+def export_repo(repspec: str, dest: Path, work: Path, timeout: int = CM_TIMEOUT_SECONDS,
+                require_main: bool = True) -> None:
     """cm fast-export the whole repo, then import it as git at dest. The export file is deleted afterwards."""
     work.mkdir(parents=True, exist_ok=True)
     stream = work / (re.sub(r"[^A-Za-z0-9._-]+", "_", repspec) + ".fe")
@@ -148,6 +187,6 @@ def export_repo(repspec: str, dest: Path, work: Path, timeout: int = CM_TIMEOUT_
         _cm(["fast-export", repspec, str(stream)], timeout)
         if not stream.is_file() or stream.stat().st_size == 0:
             raise PlasticError("cm fast-export wrote nothing (empty repo, or no read permission)")
-        import_stream(stream, dest)
+        import_stream(stream, dest, require_main)
     finally:
         stream.unlink(missing_ok=True)

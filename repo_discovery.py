@@ -37,6 +37,7 @@ class Target:
     local_path: Path | None = None
     clone_url: str | None = None
     platform: str = "local"
+    branch: str | None = None  # branch to sample; None = the repo's default branch
 
     @property
     def slug(self) -> str:
