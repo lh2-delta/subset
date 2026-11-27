@@ -1,7 +1,7 @@
 """First-N% commit-history sampling engine for subset.
 
-Cutoff maths: keep the first ceil(total * pct / 100) commits of the default branch, drop
-every other ref and tag, then gc. Stdlib-only so subset ships standalone.
+Cutoff maths: keep the first ceil(total * pct / 100) commits of the default branch (or the
+branch asked for), drop every other ref and tag, then gc. Stdlib-only so subset ships standalone.
 
 Every repo that is *not* sampled gets a line in samples/sampling_log.jsonl and a
 WARNING in the run log carrying the reason.
@@ -96,6 +96,39 @@ def repo_filter_from_env() -> frozenset[str]:
     return parse_repo_filter(os.environ.get(REPOS_ENV))
 
 
+def normalise_branch(raw: str | None) -> str | None:
+    """A branch name to sample, or None for the repo's default branch.
+
+    Accepts `name`, `refs/heads/name` or a Plastic-style `/main/child`. Anything git would not
+    accept as a branch name (or that could be read as an option) is refused, never guessed at.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    name = text.removeprefix("refs/heads/").lstrip("/")
+    ok = bool(name) and not name.startswith("-") and subprocess.run(
+        ["git", "check-ref-format", f"refs/heads/{name}"], capture_output=True,
+    ).returncode == 0
+    if not ok:
+        raise SampleConfigError(f"not a valid branch name: {text!r}")
+    return name
+
+
+def parse_repo_branches(pairs: list[str]) -> dict[str, str]:
+    """`repo=branch` entries -> {selector: branch}. The selector matches like --repo."""
+    out: dict[str, str] = {}
+    for pair in pairs:
+        repo, sep, branch = pair.partition("=")
+        repo = repo.strip().strip("/").lower()
+        if not sep or not repo:
+            raise SampleConfigError(f"want REPO=BRANCH, got {pair!r}")
+        name = normalise_branch(branch)
+        if name is None:
+            raise SampleConfigError(f"no branch given for {repo!r} in {pair!r}")
+        out[repo] = name
+    return out
+
+
 def selector_matches(selector: str, full_name: str) -> bool:
     """A selector is a full `org/repo` name or a bare repo name."""
     name = full_name.strip("/").lower()
@@ -182,6 +215,32 @@ def _default_branch(repo: Path) -> tuple[str, str, str]:
     if head.startswith("refs/heads/") and _ref_exists(repo, head):
         return head[len("refs/heads/"):], head, "checked-out HEAD"
     raise SampleSkipped("no branch to sample (detached HEAD, no origin/HEAD, no main/master/trunk)")
+
+
+def branch_names(repo: Path) -> list[str]:
+    """Local branches plus origin's remote-tracking branches, de-duplicated, sorted."""
+    out = _git(["for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes/origin"], repo,
+               check=False).stdout.split()
+    names = {r[len("refs/heads/"):] if r.startswith("refs/heads/") else r[len("refs/remotes/origin/"):] for r in out}
+    names.discard("HEAD")
+    return sorted(names)
+
+
+def default_branch_name(repo: Path) -> str | None:
+    try:
+        return _default_branch(repo)[0]
+    except SampleSkipped:
+        return None
+
+
+def _requested_branch(repo: Path, name: str) -> tuple[str, str, str]:
+    """(short name, full ref, how) for a branch the user asked for. Missing -> skipped, never the default."""
+    for ref in (f"refs/heads/{name}", f"refs/remotes/origin/{name}"):
+        if _ref_exists(repo, ref):
+            return name, ref, "requested"
+    available = branch_names(repo)
+    shown = ", ".join(available[:10]) + (f" (+{len(available) - 10} more)" if len(available) > 10 else "")
+    raise SampleSkipped(f"branch {name!r} not found (branches: {shown or 'none'})")
 
 
 def _cutoff(repo: Path, ref: str, pct: float, min_commits: int) -> tuple[str, int, int]:
@@ -274,8 +333,12 @@ def take_sample(
     min_commits: int,
     log: logging.Logger,
     extra_manifest: dict | None = None,
+    branch: str | None = None,
 ) -> bool:
     """Write run_dir/samples/<slug>/ holding the first pct% of history.
+
+    `branch` picks the branch to sample (local branch, else origin's); None = the default
+    branch. A branch that does not exist is a logged skip, never a fallback to the default.
 
     `disposable` means source is a throwaway clone: it is moved into place
     rather than copied, which avoids doubling disk use on large repos. A local
@@ -286,6 +349,7 @@ def take_sample(
     """
     dest = run_dir / SAMPLES_DIRNAME / slug
     staging = run_dir / SAMPLES_DIRNAME / f".staging-{slug}"
+    requested = branch
     try:
         if not (source / ".git").exists():
             raise SampleSkipped(f"not a non-bare git working tree: {source.name}")
@@ -299,7 +363,8 @@ def take_sample(
                 "source is a shallow clone; its commit count and cutoff would be wrong "
                 "(run `git fetch --unshallow` first)"
             )
-        branch, branch_ref, branch_how = _default_branch(source)
+        branch, branch_ref, branch_how = (
+            _requested_branch(source, requested) if requested else _default_branch(source))
         log.info("SAMPLE %s: using branch %s (%s)", repo_name, branch, branch_how)
         cutoff_sha, total, keep = _cutoff(source, branch_ref, pct, min_commits)
 
@@ -339,6 +404,7 @@ def take_sample(
         log.info("SAMPLED %s: %s of %s commits on %s", repo_name, reachable, total, branch)
         append_log(run_dir, {
             "repo": repo_name, "slug": slug, "status": "sampled",
+            "branch": branch, "branch_chosen_by": branch_how,
             "total_commits": total, "sampled_commits": reachable,
             "fsck_clean": fsck_clean,
             **({"source_vcs": extra_manifest["source_vcs"]} if extra_manifest and "source_vcs" in extra_manifest else {}),
@@ -354,14 +420,17 @@ def take_sample(
     shutil.rmtree(staging, ignore_errors=True)
     shutil.rmtree(dest, ignore_errors=True)
     log.warning("SAMPLE SKIPPED %s: %s", repo_name, reason)
-    append_log(run_dir, {"repo": repo_name, "slug": slug, "status": "skipped", "reason": reason})
+    append_log(run_dir, {"repo": repo_name, "slug": slug, "status": "skipped", "reason": reason,
+                         **({"requested_branch": requested} if requested else {})})
     return False
 
 
-def log_skip(run_dir: Path, repo_name: str, slug: str, reason: str, log: logging.Logger) -> None:
+def log_skip(run_dir: Path, repo_name: str, slug: str, reason: str, log: logging.Logger,
+             branch: str | None = None) -> None:
     """Record a repo that never reached the sampler (e.g. clone/metrics failed)."""
     log.warning("SAMPLE SKIPPED %s: %s", repo_name, reason)
-    append_log(run_dir, {"repo": repo_name, "slug": slug, "status": "skipped", "reason": reason})
+    append_log(run_dir, {"repo": repo_name, "slug": slug, "status": "skipped", "reason": reason,
+                         **({"requested_branch": branch} if branch else {})})
 
 
 def logged_slugs(run_dir: Path) -> set[str]:
@@ -377,7 +446,8 @@ def logged_slugs(run_dir: Path) -> set[str]:
 
 def write_report(run_dir: Path, pct: float, min_commits: int,
                  repo_filter: frozenset[str] = frozenset(),
-                 unmatched: list[str] | None = None) -> dict:
+                 unmatched: list[str] | None = None, branch: str | None = None,
+                 repo_branches: dict[str, str] | None = None) -> dict:
     """Collapse sampling_log.jsonl (latest entry per repo wins) into a report."""
     samples_dir = run_dir / SAMPLES_DIRNAME
     latest: dict[str, dict] = {}
@@ -394,6 +464,8 @@ def write_report(run_dir: Path, pct: float, min_commits: int,
         "min_commits": min_commits,
         "selected_repos": sorted(repo_filter) or "all",
         "selectors_matching_no_repo": unmatched or [],
+        "branch": branch or "default",
+        "repo_branches": repo_branches or {},
         "sampled_count": len(sampled),
         "skipped_count": len(skipped),
         "sampled": sorted(sampled, key=lambda e: e["repo"]),

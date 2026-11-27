@@ -40,6 +40,19 @@ def make_repo(path: Path, commits: int) -> Path:
     return path
 
 
+def add_commits(repo: Path, branch: str, n: int) -> None:
+    """Add n commits on `branch` (created from the current HEAD if new), then go back to where we were."""
+    back = git(repo, "symbolic-ref", "--short", "HEAD")
+    exists = subprocess.run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=repo).returncode == 0
+    git(repo, "checkout", "-q", *([] if exists else ["-b"]), branch)
+    for i in range(n):
+        (repo / f"{branch.replace('/', '_')}-{i}.txt").write_text(f"{i}\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", f"{branch} {i}")
+    if branch != back:
+        git(repo, "checkout", "-q", back)
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -557,6 +570,8 @@ if a[:2] == ["repo", "list"]:
     if a[2] == "down:8087":
         sys.exit("Error: Connection refused")
     print("game\nengine@" + a[2])
+elif a[:2] == ["find", "branch"]:
+    print("/main\n/main/task001")
 elif a[0] == "fast-export":
     name = a[1].split("@", 1)[0]
     src = os.path.join(store, name + ".fe")
@@ -568,10 +583,12 @@ else:
 """
 
 
-def make_export(repo: Path, out: Path, branch: str = "master") -> Path:
+def make_export(repo: Path, out: Path, branch: str = "master", child_commits: int = 0) -> Path:
     """A `cm fast-export`-like stream: Plastic's /main arrives as `branch`, plus a child branch."""
     git(repo, "branch", "-m", branch)
     git(repo, "branch", "main-task001")
+    if child_commits:
+        add_commits(repo, "main-task001", child_commits)
     out.write_bytes(subprocess.run(["git", "fast-export", "--all"], cwd=repo, check=True, capture_output=True).stdout)
     return out
 
@@ -673,6 +690,174 @@ class PlasticTests(Base):
         body = json.loads(urllib.request.urlopen(urllib.request.Request(base + "/detect", data=data)).read())
         self.assertEqual([i["key"] for i in body["items"]], ["plastic|srv:8087/engine", "plastic|srv:8087/game"])
         self.assertIn("Plastic SCM", urllib.request.urlopen(base + "/").read().decode())
+
+    def test_branch_candidates_and_resolve(self):
+        self.assertEqual(plastic._branch_candidates("/main/task001"), ["main/task001", "main-task001", "task001"])
+        clone = self.tmp / "imp"
+        plastic.import_stream(self.store / "game.fe", clone)
+        self.assertIsNone(plastic.resolve_branch(clone, None))
+        self.assertIsNone(plastic.resolve_branch(clone, "/main"))
+        self.assertEqual(plastic.resolve_branch(clone, "main/task001"), "main-task001")
+        with self.assertRaisesRegex(plastic.PlasticError, "not found in the Plastic export.*main-task001"):
+            plastic.resolve_branch(clone, "main/nope")
+
+    def test_child_branch_is_sampled(self):
+        make_export(make_repo(self.tmp / "src-story", 30), self.store / "story.fe", child_commits=30)
+        result = subset.run_job([plastic.parse_repspec("story@srv:8087"), plastic.parse_repspec("game@srv:8087")],
+                                pct=5, min_commits=20, workers=2, output_dir=self.tmp / "out",
+                                branch=sampler.normalise_branch("/main/task001"))
+        report = result["report"]
+        self.assertEqual({e["repo"]: e["branch"] for e in report["sampled"]},
+                         {"srv:8087/story": "main-task001", "srv:8087/game": "main-task001"})
+        manifest = json.loads((result["run_dir"] / "samples" / "srv__8087__story" / "SAMPLE_MANIFEST.json").read_text())
+        self.assertEqual((manifest["plastic_branch"], manifest["branch_sampled"], manifest["total_commits"]),
+                         ("/main/task001", "main-task001", 60))
+        self.assertEqual(report["branch"], "main/task001")
+
+    def test_missing_plastic_branch_is_a_skip_and_main_needs_no_main(self):
+        targets = [plastic.parse_repspec("game@srv:8087"), plastic.parse_repspec("odd@srv:8087")]
+        result = subset.run_job(targets, pct=5, min_commits=20, workers=1, output_dir=self.tmp / "out",
+                                repo_branches={"game": "main/nope", "odd": "trunk-only"})
+        report = result["report"]
+        self.assertEqual([e["repo"] for e in report["sampled"]], ["srv:8087/odd"])  # no /main needed for another branch
+        skip = report["skipped"][0]
+        self.assertIn("branch 'main/nope' not found in the Plastic export", skip["reason"])
+        self.assertEqual(skip["requested_branch"], "main/nope")
+        found = {e["repo"]: e for e in report["sampled"]}
+        self.assertEqual(found["srv:8087/odd"]["branch"], "trunk-only")
+
+    def test_plastic_list_branches(self):
+        self.assertEqual(subset.list_branches(plastic.parse_repspec("game@srv:8087")), (["/main", "/main/task001"], "/main"))
+        self.assertEqual(subset.list_branches(plastic.export_target("g", self.store / "game.fe")), ([], "/main"))
+
+
+class BranchTests(Base):
+    """--branch / --repo-branch / [branch=X] / UI branch picker. acme/big has `develop` = main + 20 commits."""
+
+    def setUp(self):
+        super().setUp()
+        add_commits(self.repos / "acme" / "big", "develop", 20)
+
+    def run_job(self, targets, **kw):
+        return subset.run_job(targets, **{**dict(pct=10, min_commits=20, workers=2, output_dir=self.tmp / "out"), **kw})
+
+    def manifest(self, result, slug):
+        return json.loads((result["run_dir"] / "samples" / slug / "SAMPLE_MANIFEST.json").read_text())
+
+    def test_default_branch_unchanged_without_option(self):
+        result = self.run_job(subset.discover_local_repos(self.repos))
+        m = self.manifest(result, "acme__big")
+        self.assertEqual((m["branch_sampled"], m["total_commits"], m["reachable_commits_in_sample"]), ("main", 40, 4))
+        self.assertEqual(result["report"]["branch"], "default")
+        self.assertEqual({e["repo"]: e["branch"] for e in result["report"]["sampled"]}, {"acme/big": "main", "solo": "main"})
+
+    def test_branch_for_every_repo_and_missing_branch_is_a_skip(self):
+        result = self.run_job(subset.discover_local_repos(self.repos), branch="develop")
+        m = self.manifest(result, "acme__big")
+        self.assertEqual((m["branch_sampled"], m["branch_chosen_by"], m["total_commits"]), ("develop", "requested", 60))
+        out = result["run_dir"] / "samples" / "acme__big"
+        self.assertEqual(git(out, "rev-list", "--count", "HEAD"), "6")
+        self.assertEqual(git(out, "for-each-ref", "--format=%(refname)"), "refs/heads/sample10pct")
+        self.assertEqual(git(self.repos / "acme" / "big", "symbolic-ref", "--short", "HEAD"), "main")  # source untouched
+        skipped = {e["repo"]: e for e in result["report"]["skipped"]}
+        self.assertEqual(skipped["solo"]["reason"], "branch 'develop' not found (branches: main)")
+        self.assertEqual(skipped["solo"]["requested_branch"], "develop")
+        self.assertFalse((result["run_dir"] / "samples" / "solo").exists())  # never a silent fallback to main
+        self.assertEqual(result["report"]["branch"], "develop")
+
+    def test_per_repo_branch_wins(self):
+        targets = subset.discover_local_repos(self.repos)
+        result = self.run_job(targets, branch="nope", repo_branches={"big": "develop", "solo": "main", "ghost": "x"})
+        self.assertEqual({e["repo"]: e["branch"] for e in result["report"]["sampled"]}, {"acme/big": "develop", "solo": "main"})
+        self.assertIn("branch 'nope' not found", result["report"]["skipped"][0]["reason"])
+        self.assertIn("--repo-branch names matching no repo: ghost",
+                      (result["run_dir"] / "logs" / "subset.log").read_text())
+        pinned = subset.Target("acme/big", local_path=self.repos / "acme" / "big", branch="main")
+        result = self.run_job([pinned], output_dir=self.tmp / "out2", repo_branches={"big": "develop"})
+        self.assertEqual(result["report"]["sampled"][0]["branch"], "main")  # Target.branch beats --repo-branch
+
+    def test_remote_clone_samples_remote_tracking_branch(self):
+        url = (self.repos / "acme" / "big").as_uri()
+        good = subset.Target("org/dev", clone_url=url, platform="github", branch="develop")
+        bad = subset.Target("org/gone", clone_url=url, platform="github", branch="release")
+        report = self.run_job([good, bad])["report"]
+        self.assertEqual([(e["repo"], e["branch"], e["total_commits"]) for e in report["sampled"]], [("org/dev", "develop", 60)])
+        self.assertEqual(report["skipped"][0]["reason"], "branch 'release' not found (branches: develop, main)")
+
+    def test_branch_name_parsing(self):
+        self.assertIsNone(sampler.normalise_branch("  "))
+        self.assertEqual(sampler.normalise_branch("refs/heads/release/2.0"), "release/2.0")
+        self.assertEqual(sampler.normalise_branch("/main/task001"), "main/task001")
+        for bad in ("-x", "a..b", "a b", "x~1", "/"):
+            with self.assertRaises(sampler.SampleConfigError, msg=bad):
+                sampler.normalise_branch(bad)
+        self.assertEqual(sampler.parse_repo_branches(["Acme/Big=develop"]), {"acme/big": "develop"})
+        for bad in (["big"], ["=dev"], ["big="], ["big=-x"]):
+            with self.assertRaises(sampler.SampleConfigError, msg=bad):
+                sampler.parse_repo_branches(bad)
+        t = subset.parse_remote("acme/widgets [branch=release/2.0]")
+        self.assertEqual((t.full_name, t.branch), ("acme/widgets", "release/2.0"))
+        self.assertIsNone(subset.parse_remote("acme/widgets [some note]").branch)
+        with self.assertRaises(ValueError):
+            subset.parse_remote("acme/widgets [branch=a..b]")
+
+    def test_cli_branch_options(self):
+        out = self.tmp / "cli"
+        rc = subset.main(["--local-repos-dir", str(self.repos), "--branch", "develop", "--repo-branch", "solo=main",
+                          "--output-dir", str(out)])
+        self.assertEqual(rc, 0)
+        report = json.loads(next(out.glob("subset-*/samples/sampling_report.json")).read_text())
+        self.assertEqual({e["repo"]: e["branch"] for e in report["sampled"]}, {"acme/big": "develop", "solo": "main"})
+        self.assertEqual(report["repo_branches"], {"solo": "main"})
+        self.assertEqual(subset.main(["--local-repos-dir", str(self.repos), "--branch=-rf"]), 2)
+        self.assertEqual(subset.main(["--local-repos-dir", str(self.repos), "--repo-branch", "solo"]), 2)
+
+    def test_list_branches(self):
+        big = self.repos / "acme" / "big"
+        self.assertEqual(subset.list_branches(subset.Target("acme/big", local_path=big)), (["develop", "main"], "main"))
+        remote = subset.Target("org/x", clone_url=big.as_uri(), platform="github")
+        self.assertEqual(subset.list_branches(remote, {}), (["develop", "main"], "main"))
+        with self.assertRaisesRegex(RuntimeError, "listing branches failed"):
+            subset.list_branches(subset.Target("org/y", clone_url=(self.tmp / "nope").as_uri(), platform="github"))
+
+
+class UiBranchTests(UiTests):
+    """Runs UiTests again too, so keep this one small."""
+
+    def setUp(self):
+        super().setUp()
+        add_commits(self.repos / "acme" / "big", "develop", 20)
+
+    def wait(self):
+        for _ in range(150):
+            snap = json.loads(urllib.request.urlopen(self.base + "/status").read())
+            if snap["progress"].get("finished") and not snap["running"]:
+                return snap
+            threading.Event().wait(0.2)
+        self.fail("run did not finish")
+
+    def test_branches_endpoint(self):
+        code, body = self.post("/branches", kind="local", local_dir=str(self.repos), name="acme/big")
+        self.assertEqual((code, json.loads(body)), (200, {"branches": ["develop", "main"], "default": "main"}))
+        subset_ui.STATE["detected"] = {"github|org/x": subset.Target("org/x", clone_url=(self.repos / "solo").as_uri(),
+                                                                    platform="github")}
+        code, body = self.post("/branches", kind="remote", key="github|org/x")
+        self.assertEqual((code, json.loads(body)), (200, {"branches": ["main"], "default": "main"}))
+        self.assertEqual(self.post("/branches", kind="remote", key="github|unknown")[0], 400)
+        self.assertEqual(self.post("/branches", kind="local", local_dir=str(self.repos), name="nope")[0], 400)
+
+    def test_start_with_global_and_per_repo_branch(self):
+        self.assertEqual(self.post("/start", local_dir=str(self.repos), branch="a..b")[0], 400)
+        code, _ = self.post("/start", local_dir=str(self.repos), local_repos=["acme/big", "solo"],
+                            branch="develop", **{"lbranch:solo": "main", "lbranch:acme/small": "ignored"})
+        self.assertEqual(code, 200)
+        self.wait()
+        run_dir = Path(subset_ui.snapshot()["progress"]["run_dir"])
+        report = json.loads((run_dir / "samples" / "sampling_report.json").read_text())
+        self.assertEqual({e["repo"]: e["branch"] for e in report["sampled"]}, {"acme/big": "develop", "solo": "main"})
+        html = urllib.request.urlopen(self.base + "/").read().decode()
+        self.assertIn('name="branch"', html)
+        self.assertIn("/branches", html)
 
 
 if __name__ == "__main__":

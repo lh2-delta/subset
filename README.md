@@ -19,14 +19,14 @@ Each run creates `outputs/subset-<timestamp>/` and a matching `outputs/subset-<t
 ```
 samples/<org__repo>/            a standalone git repo holding the first 5% of commits
 samples/<org__repo>/SAMPLE_MANIFEST.json   branch, totals, cutoff commit, fsck result
-samples/sampling_log.jsonl      one line per repo: sampled, or skipped + the reason
+samples/sampling_log.jsonl      one line per repo: sampled (+ the branch), or skipped + the reason
 samples/sampling_report.json    the same, summarised (sampled / skipped lists)
 logs/subset.log                 full run log
 ```
 
 **The samples contain real source code and history.** Treat the zip accordingly.
 
-How a sample is cut: take the repo's default branch, keep the oldest `ceil(total x 5 / 100)`
+How a sample is cut: take the repo's default branch (or the branch you chose, see "Choosing the branch"), keep the oldest `ceil(total x 5 / 100)`
 commits, delete every other branch, tag and remote, then `git gc`. Tags are deleted because a tag
 past the cutoff would keep the later history reachable.
 
@@ -44,7 +44,9 @@ Open <http://localhost:8768>.
 2. Click **Load repos**. Every git repo found up to 3 folders deep is listed, grouped by folder (a toggle per group; click a group to expand it).
 3. Tick the repos to sample. **Nothing ticked = every repo found.**
 4. Optional: detect remote repos with a token (GitHub, GitLab, Bitbucket Cloud or Data Center) and tick the ones you want. See "Detecting remote repos".
-5. Click **Create samples**. Watch progress, then **Download zip**. The same files are in `./outputs`.
+5. Optional: type a **Branch** for every repo, or click a repo's **branch** button to pick one of its branches
+   from a dropdown (see "Choosing the branch").
+6. Click **Create samples**. Watch progress, then **Download zip**. The same files are in `./outputs`.
 
 When the run ends the page lists every repo that was **not** sampled and why.
 
@@ -58,6 +60,7 @@ python subset.py --local-repos-dir ./repos
 python subset.py --local-repos-dir ./repos --repo alpha --repo acme/beta
 python subset.py --remote acme/widgets --remote https://gitlab.com/grp/proj
 python subset.py --remote-file remote.txt --workers 8
+python subset.py --local-repos-dir ./repos --branch develop --repo-branch acme/beta=release/2.0
 ```
 
 | Flag | Meaning |
@@ -71,6 +74,8 @@ python subset.py --remote-file remote.txt --workers 8
 | `--default-platform` | What a bare `owner/repo` means: `github` (default), `gitlab`, `bitbucket`. |
 | `--gitlab-host` | Host for bare `owner/repo` when the platform is `gitlab`. |
 | `--repo NAME` | Only sample these (repeatable). `org/repo` or bare `repo`. Others are logged as not sampled. |
+| `--branch NAME` | Sample this branch in every repo instead of its default branch (Plastic: `/main/child`). |
+| `--repo-branch REPO=NAME` | Branch for one repo (`org/repo` or bare name, repeatable); wins over `--branch`. |
 | `--workers N` | Repos processed in parallel (default 4). |
 | `--output-dir DIR` | Default `./outputs` (`SUBSET_OUTPUT_DIR` also works). |
 
@@ -139,12 +144,37 @@ Never commit `tokens`, `secrets/` or `.env`.
 `--remote owner/repo`, `--remote https://...` or `--remote-file F` still work for a handful of
 public or known repos. They are not in the UI any more.
 
+## Choosing the branch
+
+By default each repo's default branch is sampled: `origin/HEAD`, else `main` / `master` / `trunk`, else
+the checked-out branch (Plastic: `/main`). To sample another branch:
+
+| Where | How |
+|---|---|
+| CLI, every repo | `--branch develop` |
+| CLI, one repo | `--repo-branch acme/beta=release/2.0` (repeatable; wins over `--branch`) |
+| `--remote` / `--remote-file` line | `acme/beta [branch=release/2.0]` (wins over both flags) |
+| UI, every repo | the **Branch** box under the repo lists |
+| UI, one repo | the repo's **branch** button: lists its branches (local refs, `git ls-remote` for remote repos, `cm find branch` for Plastic) in a dropdown, defaulting to the default branch; wins over the Branch box |
+
+A local branch is used first, then `origin/<name>` (a fresh clone only has the default branch locally).
+**A repo that does not have the branch is not sampled**: it is logged as `branch 'X' not found (branches: ...)`
+with `requested_branch` in `sampling_log.jsonl`. It is never swapped for the default branch.
+The branch sampled is recorded in `SAMPLE_MANIFEST.json` (`branch_sampled`, `branch_chosen_by: "requested"`),
+in each `sampling_log.jsonl` line, and in `sampling_report.json` (`branch`, `repo_branches`).
+
 ## Unity Version Control (Plastic SCM)
 
 Plastic repos are sampled the same way as git repos: the history is turned into a git repo first, then the first 5% of
 commits of Plastic's `/main` branch is kept (repos under 20 changesets on `/main` are skipped). Each Plastic changeset becomes one
 git commit (message `Changeset: N <comment>`); child branches, labels and other refs are removed as usual.
 `SAMPLE_MANIFEST.json` adds `"source_vcs": "plastic"` and the repo spec or export file name.
+
+**Another Plastic branch.** `--branch /main/task001` (or the UI) samples a child branch instead of `/main`. The export already
+holds every branch, so the branch is looked up among the imported git branches as `main/task001`, `main-task001` or `task001`
+(the name `cm fast-export` gives it can vary by version); the manifest adds `"plastic_branch"`. If none of those exists the repo is
+not sampled and the reason lists the imported branch names, so you can pass the exact one. For a `.fe` file the UI shows a text box
+instead of a dropdown (the file is only read when sampled).
 
 Three ways in:
 
@@ -191,13 +221,14 @@ Every skipped repo gets a `SAMPLE SKIPPED <repo>: <reason>` line in the log, an 
 | `not a non-bare git working tree` | Bare mirrors aren't supported; clone a working tree. |
 | `clone failed: ...` | Check the token's clone access and network. Tokens are redacted in the message. |
 | `not in the selected sample list` | It wasn't ticked / named in `--repo`. |
+| `branch 'X' not found (branches: ...)` | The repo has no such branch. Pick one from the list, or leave the branch blank for the default. |
 
 A name passed to `--repo` that matches no repo is reported under `selectors_matching_no_repo`.
 
 ## Notes and limits
 
 - Local repos are **copied** before slicing, so you need free disk space for one copy per worker at a time.
-- Only the default branch's history is sampled (the branch checked out in a local clone).
+- One branch per repo is sampled: the default branch, or the one you chose.
 - One run at a time in the UI. Close the terminal and a running job stops.
 - The UI binds to `127.0.0.1` (or `0.0.0.0` inside Docker, published to your host only through the compose port).
 

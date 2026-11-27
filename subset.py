@@ -9,6 +9,10 @@ Sources:
   --plastic-server S      every repo on a Plastic server (needs cm; narrow with --repo)
   --plastic-export FILE   a `cm fast-export` file made elsewhere (no cm needed)
 
+Branch: the default branch is sampled (Plastic: /main) unless --branch NAME (every repo) or
+--repo-branch REPO=NAME (one repo) says otherwise; a remote entry may end in [branch=NAME].
+A branch that does not exist is logged as not sampled, never swapped for the default.
+
 Usage:
   python subset.py --local-repos-dir ./repos
   python subset.py --local-repos-dir ./repos --repo alpha --repo org/beta
@@ -18,6 +22,7 @@ Usage:
   python subset.py --plastic game@plastic.example.com:8087
   python subset.py --plastic-server myorg@cloud --list-only
   python subset.py --plastic-export ./game.fe
+  python subset.py --local-repos-dir ./repos --branch develop --repo-branch acme/beta=release/2.0
   python subset.py --ui                       # browser UI on http://127.0.0.1:8768
 
 Output: outputs/subset-<stamp>/ with samples/<org__repo>/, samples/sampling_log.jsonl,
@@ -64,6 +69,8 @@ HOSTS = {"github": "github.com", "gitlab": "gitlab.com", "bitbucket": "bitbucket
 TOKEN_USER = {"github": "x-access-token", "gitlab": "oauth2", "bitbucket": "x-token-auth"}
 # Bitbucket Data Center takes a Bearer header (HTTP access token), not a URL login.
 DC_KEY_RE = re.compile(r"data_?center|(^|[_-])(dc|server)([_-]|$)")
+BRANCH_SUFFIX_RE = re.compile(r"\bbranch\s*[=:]\s*([^\s\],]+)", re.I)
+LS_REMOTE_TIMEOUT_SECONDS = 120
 
 
 # ── discovery / parsing ─────────────────────────────────────────────────────
@@ -136,6 +143,13 @@ def resolve_local_selectors(root: Path, selectors: list[str]) -> list[Target]:
 
 
 def parse_remote(spec: str, default_platform: str = "github", gitlab_host: str = "gitlab.com") -> Target:
+    """`owner/repo`, an https URL or `git@host:owner/repo`; a trailing `[branch=NAME]` picks the branch to sample."""
+    suffix = re.search(r"\s*\[([^\]]*)\]\s*$", spec.strip())
+    branch_m = BRANCH_SUFFIX_RE.search(suffix.group(1)) if suffix else None
+    try:
+        branch = sampler.normalise_branch(branch_m.group(1)) if branch_m else None
+    except sampler.SampleConfigError as exc:
+        raise ValueError(f"{exc} in repo entry {spec!r}") from None
     text = re.sub(r"\s*\[[^\]]*\]\s*$", "", spec.strip())
     if not text:
         raise ValueError("empty repo entry")
@@ -155,7 +169,7 @@ def parse_remote(spec: str, default_platform: str = "github", gitlab_host: str =
     platform = next((k for k, v in HOSTS.items() if v == host), None)
     if platform is None:
         platform = "gitlab"  # self-hosted: only GitLab hosts are configurable in the UI
-    return Target(full_name=path, clone_url=f"https://{host}/{path}.git", platform=platform)
+    return Target(full_name=path, clone_url=f"https://{host}/{path}.git", platform=platform, branch=branch)
 
 
 def parse_tokens_file(path: Path | None) -> dict[str, str]:
@@ -212,8 +226,7 @@ def git_config_env(env: dict[str, str], pairs: list[tuple[str, str]]) -> None:
     env["GIT_CONFIG_COUNT"] = str(count)
 
 
-def clone_full(target: Target, dest: Path, tokens: dict[str, str], timeout: int,
-               insecure_tls: bool = False) -> None:
+def _remote_git_env(target: Target, tokens: dict[str, str], insecure_tls: bool) -> dict[str, str]:
     env = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1", "GIT_TERMINAL_PROMPT": "0"}
     extra: list[tuple[str, str]] = []
     if target.platform == "bitbucket_dc" and tokens.get("bitbucket_dc"):
@@ -221,6 +234,52 @@ def clone_full(target: Target, dest: Path, tokens: dict[str, str], timeout: int,
     if insecure_tls:
         extra.append(("http.sslVerify", "false"))
     git_config_env(env, extra)
+    return env
+
+
+def remote_branches(target: Target, tokens: dict[str, str], insecure_tls: bool = False,
+                    timeout: int = LS_REMOTE_TIMEOUT_SECONDS) -> tuple[list[str], str | None]:
+    """(branch names, default branch) of a remote repo via `git ls-remote --symref`; nothing is cloned."""
+    try:
+        proc = subprocess.run(
+            ["git", "ls-remote", "--symref", authed_url(target, tokens), "HEAD", "refs/heads/*"],
+            capture_output=True, text=True, timeout=timeout, env=_remote_git_env(target, tokens, insecure_tls),
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"listing branches timed out after {timeout}s") from None
+    if proc.returncode != 0:
+        detail = redact((proc.stderr or proc.stdout or "ls-remote failed").strip(), tokens)
+        raise RuntimeError(f"listing branches failed: {detail[-300:]}")
+    names, default = [], None
+    for line in proc.stdout.splitlines():
+        left, _, ref = line.partition("\t")
+        if left.startswith("ref: refs/heads/") and ref == "HEAD":
+            default = left[len("ref: refs/heads/"):]
+        elif ref.startswith("refs/heads/"):
+            names.append(ref[len("refs/heads/"):])
+    return sorted(names), default
+
+
+def list_branches(target: Target, tokens: dict[str, str] | None = None,
+                  insecure_tls: bool = False) -> tuple[list[str], str | None]:
+    """(branch names, default branch) for any target: local refs, `git ls-remote`, or the Plastic server via cm.
+
+    Raises RuntimeError / plastic.PlasticError with a readable, token-free message."""
+    tokens = tokens or {}
+    if target.platform == plastic.PLATFORM:
+        if not target.clone_url:
+            raise plastic.PlasticError("Plastic workspace without a readable repo in .plastic/plastic.selector")
+        return plastic.list_branches(target.clone_url), "/main"
+    if target.platform == "plastic_export":
+        return [], "/main"  # a .fe file is only read when sampled; type the branch instead
+    if target.local_path is not None:
+        return sampler.branch_names(target.local_path), sampler.default_branch_name(target.local_path)
+    return remote_branches(target, tokens, insecure_tls)
+
+
+def clone_full(target: Target, dest: Path, tokens: dict[str, str], timeout: int,
+               insecure_tls: bool = False) -> None:
+    env = _remote_git_env(target, tokens, insecure_tls)
     if dest.exists():
         shutil.rmtree(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -301,28 +360,41 @@ def zip_run_dir(run_dir: Path) -> Path:
 
 
 def sample_plastic(target: Target, run_dir: Path, pct: float, min_commits: int, timeout: int,
-                   log: logging.Logger) -> bool:
-    """Turn a Plastic repo (server repo or fast-export file) into git, then sample it like any repo."""
+                   log: logging.Logger, branch: str | None = None) -> bool:
+    """Turn a Plastic repo (server repo or fast-export file) into git, then sample it like any repo.
+
+    branch: a Plastic branch (``/main/task001``); None or ``/main`` = Plastic's main branch."""
     clone = run_dir / "clones" / target.slug
     extra = {"source_vcs": "plastic"}
+    on_main = not branch or branch.strip().strip("/") == "main"
     try:
         if target.platform == "plastic_export":
             extra["plastic_export_file"] = target.local_path.name
             log.info("PLASTIC %s: importing %s", target.full_name, target.local_path.name)
-            plastic.import_stream(target.local_path, clone)
+            plastic.import_stream(target.local_path, clone, require_main=on_main)
         else:
             if not target.clone_url:
                 raise plastic.PlasticError("Plastic workspace without a readable repo in .plastic/plastic.selector")
             extra["plastic_repspec"] = target.clone_url
             log.info("PLASTIC %s: cm fast-export %s", target.full_name, target.clone_url)
-            plastic.export_repo(target.clone_url, clone, run_dir / "clones" / ".plastic-export", timeout)
+            plastic.export_repo(target.clone_url, clone, run_dir / "clones" / ".plastic-export", timeout,
+                                require_main=on_main)
     except (plastic.PlasticError, OSError, subprocess.TimeoutExpired) as exc:
         shutil.rmtree(clone, ignore_errors=True)
-        sampler.log_skip(run_dir, target.full_name, target.slug, f"Plastic export failed: {exc}", log)
+        sampler.log_skip(run_dir, target.full_name, target.slug, f"Plastic export failed: {exc}", log, branch)
         return False
     try:
+        git_branch = plastic.resolve_branch(clone, branch)
+    except plastic.PlasticError as exc:
+        shutil.rmtree(clone, ignore_errors=True)
+        sampler.log_skip(run_dir, target.full_name, target.slug, str(exc), log, branch)
+        return False
+    if git_branch:
+        extra["plastic_branch"] = "/" + branch.strip().lstrip("/")
+    try:
         return sampler.take_sample(repo_name=target.full_name, slug=target.slug, source=clone, disposable=True,
-                                   run_dir=run_dir, pct=pct, min_commits=min_commits, log=log, extra_manifest=extra)
+                                   run_dir=run_dir, pct=pct, min_commits=min_commits, log=log, extra_manifest=extra,
+                                   branch=git_branch)
     finally:
         shutil.rmtree(clone, ignore_errors=True)
 
@@ -340,9 +412,22 @@ def run_job(
     insecure_tls: bool = False,
     progress: dict | None = None,
     logger_name: str = "subset",
+    branch: str | None = None,
+    repo_branches: dict[str, str] | None = None,
 ) -> dict:
-    """Sample every target; returns {run_dir, zip, report}. Never raises per-repo."""
+    """Sample every target; returns {run_dir, zip, report}. Never raises per-repo.
+
+    Branch per repo, most specific wins: target.branch, then a repo_branches selector
+    (org/repo or bare name, like --repo), then `branch`; none of them = the default branch."""
     tokens = tokens or {}
+    repo_branches = repo_branches or {}
+
+    def branch_for(target: Target) -> str | None:
+        if target.branch:
+            return target.branch
+        hit = next((b for sel, b in repo_branches.items() if sampler.selector_matches(sel, target.full_name)), None)
+        return hit or branch
+
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = output_dir / f"subset-{stamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -351,37 +436,42 @@ def run_job(
     lock = threading.Lock()
     progress.update(run_dir=str(run_dir), total=len(targets), done=0, sampled=0, skipped=0,
                     current=[], recent=recent.lines)
-    log.info("subset: %s repo(s), keep first %g%% of commits, min %s commits, %s worker(s)",
-             len(targets), pct, min_commits, workers)
+    log.info("subset: %s repo(s), keep first %g%% of commits, min %s commits, %s worker(s), branch: %s",
+             len(targets), pct, min_commits, workers, branch or "default")
+    for sel, name in sorted(repo_branches.items()):
+        log.info("subset: branch for %s: %s", sel, name)
 
     def work(target: Target) -> None:
         with lock:
             progress["current"].append(target.full_name)
         ok = False
+        want = branch_for(target)
         try:
             if not sampler.is_selected(repo_filter, target.full_name):
                 sampler.log_skip(run_dir, target.full_name, target.slug,
                                  f"not in the selected sample list ({sampler.REPOS_ENV})", log)
             elif target.platform in (plastic.PLATFORM, "plastic_export"):
-                ok = sample_plastic(target, run_dir, pct, min_commits, clone_timeout, log)
+                ok = sample_plastic(target, run_dir, pct, min_commits, clone_timeout, log, want)
             elif target.local_path is not None:
                 ok = sampler.take_sample(
                     repo_name=target.full_name, slug=target.slug, source=target.local_path,
-                    disposable=False, run_dir=run_dir, pct=pct, min_commits=min_commits, log=log)
+                    disposable=False, run_dir=run_dir, pct=pct, min_commits=min_commits, log=log,
+                    branch=want)
             else:
                 clone = run_dir / "clones" / target.slug
                 try:
                     clone_full(target, clone, tokens, clone_timeout, insecure_tls)
                 except RuntimeError as exc:
-                    sampler.log_skip(run_dir, target.full_name, target.slug, str(exc), log)
+                    sampler.log_skip(run_dir, target.full_name, target.slug, str(exc), log, want)
                 else:
                     ok = sampler.take_sample(
                         repo_name=target.full_name, slug=target.slug, source=clone,
-                        disposable=True, run_dir=run_dir, pct=pct, min_commits=min_commits, log=log)
+                        disposable=True, run_dir=run_dir, pct=pct, min_commits=min_commits, log=log,
+                        branch=want)
                     shutil.rmtree(clone, ignore_errors=True)
         except Exception as exc:  # one bad repo must not stop the batch
             sampler.log_skip(run_dir, target.full_name, target.slug,
-                             redact(f"unexpected error: {exc}", tokens), log)
+                             redact(f"unexpected error: {exc}", tokens), log, want)
         finally:
             with lock:
                 progress["current"].remove(target.full_name)
@@ -394,7 +484,10 @@ def run_job(
     unmatched = sampler.unmatched_selectors(repo_filter, [t.full_name for t in targets])
     if unmatched:
         log.warning("selected names matching no repo: %s", ", ".join(unmatched))
-    report = sampler.write_report(run_dir, pct, min_commits, repo_filter, unmatched)
+    unmatched_branches = sampler.unmatched_selectors(frozenset(repo_branches), [t.full_name for t in targets])
+    if unmatched_branches:
+        log.warning("--repo-branch names matching no repo: %s", ", ".join(unmatched_branches))
+    report = sampler.write_report(run_dir, pct, min_commits, repo_filter, unmatched, branch, repo_branches)
     shutil.rmtree(run_dir / "clones", ignore_errors=True)
     log.info("done: %s sampled, %s skipped", report["sampled_count"], report["skipped_count"])
     zip_path = zip_run_dir(run_dir)
@@ -440,6 +533,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="a file written by `cm fast-export` (repeatable; no cm needed)")
     ap.add_argument("--repo", action="append", default=[],
                     help="only sample this repo (org/repo or bare name; repeatable). Default: all found")
+    ap.add_argument("--branch", default="",
+                    help="sample this branch in every repo instead of its default branch (Plastic: e.g. /main/task001); "
+                         "a repo without it is logged as not sampled")
+    ap.add_argument("--repo-branch", action="append", default=[], metavar="REPO=BRANCH",
+                    help="branch for one repo (org/repo or bare name; repeatable); wins over --branch")
     ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="repos processed in parallel")
     ap.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     args = ap.parse_args(argv)
@@ -448,6 +546,13 @@ def main(argv: list[str] | None = None) -> int:
         import subset_ui
         subset_ui.serve(args.ui_host, args.ui_port)
         return 0
+
+    try:
+        branch = sampler.normalise_branch(args.branch)
+        repo_branches = sampler.parse_repo_branches(args.repo_branch)
+    except sampler.SampleConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     targets: list[Target] = []
     tokens = parse_tokens_file(args.tokens_file)
@@ -522,7 +627,7 @@ def main(argv: list[str] | None = None) -> int:
 
     result = run_job(
         targets, workers=args.workers, output_dir=args.output_dir,
-        tokens=tokens, insecure_tls=args.insecure_tls,
+        tokens=tokens, insecure_tls=args.insecure_tls, branch=branch, repo_branches=repo_branches,
         repo_filter=sampler.parse_repo_filter(",".join(args.repo)) or sampler.repo_filter_from_env(),
     )
     print(f"zip: {result['zip']}")
